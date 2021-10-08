@@ -2,3 +2,5 @@ typing
 numpy
 scipy
 torch
+h5py
+ase

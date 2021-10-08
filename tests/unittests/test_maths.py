@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from scipy import linalg
 from tbmalt.common import maths, batch
-from tbmalt.tests.test_utils import *
+from tests.test_utils import *
 
 
 ####################
@@ -148,8 +148,6 @@ def test_gaussian_grad(device):
 #################################
 # TBMaLT.common.maths.hellinger #
 #################################
-
-
 @fix_seed
 def test_hellinger_single(device):
     """Single point test of the hellinger distance function."""
