@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from tbmalt.common.batch import pack
 from tbmalt.common.data import bohr, atom_name, val_elect, l_num
-from tbmalt.common.structures.cell import Pbc
+from tbmalt.structures.cell import Pbc
 Tensor = torch.Tensor
 
 

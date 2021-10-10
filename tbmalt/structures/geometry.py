@@ -13,6 +13,8 @@ from h5py import Group
 from ase import Atoms
 from tbmalt.common.batch import pack, merge
 from tbmalt.data.units import length_units
+from tbmalt.structures.cell import Pbc
+
 from tbmalt.data import chemical_symbols
 Tensor = torch.Tensor
 
@@ -72,15 +74,29 @@ class Geometry:
     """
 
     __slots__ = ['atomic_numbers', 'positions', 'n_atoms',
+                 'cell', 'isperiodic', 'periodic_list', 'frac_list', 'pbc',
                  '_n_batch', '_mask_dist', '__dtype', '__device']
 
     def __init__(self, atomic_numbers: Union[Tensor, List[Tensor]],
                  positions: Union[Tensor, List[Tensor]],
+                 cell: Union[Tensor, List[Tensor]] = None,
+                 frac: Union[float, List[float]] = None,
                  units: Optional[str] = 'bohr'):
 
-        # "pack" will only effect lists of tensors
+        if isinstance(cell, list):
+            cell = pack(cell)
         self.atomic_numbers = pack(atomic_numbers)
         self.positions: Tensor = pack(positions)
+
+        # bool tensor isperiodic defines if there is solid
+        if cell is None or cell.eq(0).all():
+            self.isperiodic = False  # no system is solid
+
+        else:
+            _cell = Pbc(cell, frac, units)
+            self.cell, self.periodic_list, self.frac_list, self.pbc = \
+                _cell.cell, _cell.periodic_list, _cell.frac_list, _cell.pbc
+            self.isperiodic = True if self.periodic_list.any() else False
 
         # Mask for clearing padding values in the distance matrix.
         if (temp_mask := self.atomic_numbers != 0).all():
@@ -191,26 +207,20 @@ class Geometry:
         # *very* hard to diagnose errors.
         dtype = torch.get_default_dtype() if dtype is None else dtype
 
-        # Temporary catch for periodic systems
-        def check_not_periodic(atom_instance):
-            """Just raises an error if a system is periodic."""
-            if atom_instance.pbc.any():
-                raise NotImplementedError('TBMaLT does not support PBC')
-
         if not isinstance(atoms, list):  # If a single system
-            check_not_periodic(atoms)  # Ensure non PBC system
             return cls(  # Create a Geometry instance and return it
                 torch.tensor(atoms.get_atomic_numbers(), device=device),
                 torch.tensor(atoms.positions, device=device, dtype=dtype),
+                torch.tensor(atoms.cell, device=device, dtype=dtype),
                 units=units)
 
         else:  # If a batch of systems
-            for a in atoms:  # Ensure non PBC systems
-                check_not_periodic(a)
             return cls(  # Create a batched Geometry instance and return it
                 [torch.tensor(a.get_atomic_numbers(), device=device)
                  for a in atoms],
                 [torch.tensor(a.positions, device=device, dtype=dtype)
+                 for a in atoms],
+                [torch.tensor(a.cell, device=device, dtype=dtype)
                  for a in atoms],
                 units=units)
 

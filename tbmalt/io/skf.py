@@ -16,6 +16,8 @@ from torch import Tensor
 
 from tbmalt.common.maths import triangular_root, tetrahedral_root
 from tbmalt.data import atomic_numbers, chemical_symbols
+from tbmalt.common.batch import pack
+from tbmalt.common.maths.interpolation import poly_to_zero, vcr_poly_to_zero
 
 OptTens = Optional[Tensor]
 SkDict = Dict[Tuple[int, int], Tensor]
@@ -39,6 +41,7 @@ class Skf:
             ``hamiltonian``.
          grid: Distances at which the ``hamiltonian`` & ``overlap`` elements
             were evaluated.
+        hs_cutoff:
          r_spline: A :class:`.RSpline` object detailing the repulsive
             spline. [DEFAULT=None]
          r_poly: A :class:`.RPoly` object detailing the repulsive
@@ -128,7 +131,7 @@ class Skf:
 
     def __init__(
             self, atom_pair: Tensor, hamiltonian: SkDict, overlap: SkDict,
-            grid: Tensor, r_spline: Optional[RSpline] = None,
+            grid: Tensor, hs_cut, r_spline: Optional[RSpline] = None,
             r_poly: Optional[RPoly] = None, hubbard_us: OptTens = None,
             on_sites: OptTens = None, occupations: OptTens = None,
             mass: OptTens = None):
@@ -139,6 +142,7 @@ class Skf:
         self.hamiltonian = hamiltonian
         self.overlap = overlap
         self.grid = grid
+        self.hs_cutoff = hs_cut
 
         # Ensure grid is uniformly spaced
         if not (grid.diff().diff().abs() < 1E-5).all():
@@ -214,7 +218,8 @@ class Skf:
 
     @classmethod
     def from_skf(cls, path: str, dtype: Optional[torch.dtype] = None,
-                 device: Optional[torch.device] = None) -> 'Skf':
+                 device: Optional[torch.device] = None,
+                 smooth_to_zero: bool = True, **kwargs) -> 'Skf':
         """Parse and skf file into an `Skf` instance.
 
         File names should follow the naming convention X-Y.skf where X & Y are
@@ -233,6 +238,10 @@ class Skf:
         """
         dd = {'dtype': dtype, 'device': device}
         kwargs_in = {}
+        if not smooth_to_zero:
+            warnings.warn('`smooth_to_zero` is set as Flase, and there is no'
+                          ' tail smoothing in interpolation, please make sure'
+                          ' you understand what you have done.')
 
         # Identify the elements involved according to the file name
         e = '[A-Z][a-z]?'
@@ -252,6 +261,7 @@ class Skf:
         g_step, n_grids = lines[0].replace(',', ' ').split()[:2]
         g_step, n_grids = float(g_step), int(n_grids)
         grid = torch.arange(1, n_grids + 1, **dd) * g_step
+        hs_cut = n_grids * g_step - g_step
 
         # Determine if this is the homo/atomic case (from the file's contents)
         atomic = len(atom_ln := _s2t(_esr(lines[1]), **dd)) in [10, 13]
@@ -285,6 +295,13 @@ class Skf:
             if not (integral == 0.).all()}  # ← Ignore any dummy interactions
             for integrals in [h_data, s_data]]
 
+        # if smooth_to_zero:
+        #     h_data = {ikey: poly_to_zero(
+        #         grid, h_data[ikey]) for ikey in h_data.keys()}
+        #     s_data = {ikey: poly_to_zero(
+        #         grid, s_data[ikey]) for ikey in s_data.keys()}
+
+
         if atomic:  # Parse homo data; on-site/Hubbard-U/occupations. (skip spe)
             n = int((len(atom_ln) - 1) / 3)  # -> Number of shells specified
             occs, hubb_u, _, on_site = atom_ln.flip(0).split([n, n, 1, n])
@@ -306,11 +323,11 @@ class Skf:
                 # The exponential and tail spline's coefficients.
                 _s2t(lines[ln], **dd), _s2t(lines[ln + int(n_int)], **dd)[2:])
 
-        return cls(atom_pair, h_data, s_data, grid, **kwargs_in)
+        return cls(atom_pair, h_data, s_data, grid, hs_cut, **kwargs_in)
 
     @classmethod
     def from_hdf5(cls, source: Group, dtype: Optional[torch.dtype] = None,
-                  device: Optional[torch.device] = None) -> 'Skf':
+                  device: Optional[torch.device] = None, **kwargs) -> 'Skf':
         """Instantiate a `Skf` instances from an HDF5 group.
 
         Arguments:
@@ -344,6 +361,7 @@ class Skf:
             for n in i.dtype.fields.keys()}
             for i in [ints['H'], ints['S']])
         grid = (torch.arange(0, ints['count'][()], **dd) + 1) * ints['step'][()]
+        hs_cut = grid[-1] - ints['step'][()]
 
         if source.attrs['has_r_spline']:  # Repulsive spline data
             r = source['r_spline']
@@ -362,7 +380,7 @@ class Skf:
                            'mass': tt(a, 'mass'),
                            'occupations': tt(a, 'occupations')})
 
-        return cls(atom_pair, H, S, grid, **kwargs)
+        return cls(atom_pair, H, S, grid, hs_cut, **kwargs)
 
     def write(self, path: str, overwrite: Optional[bool] = False):
         """Save the Slater-Koster data to a file.
@@ -547,6 +565,355 @@ class Skf:
         return f'{cls_name}({name})'
 
 
+class VcrSkf(Skf):
+    """Variable compression radii Slater-Koster file parser.
+
+    Arguments:
+         atom_pair: Atomic numbers of the elements associated with the
+            interaction.
+         hamiltonian: Dictionary keyed by azimuthal-number-pairs (ℓ₁, ℓ₂) and
+            valued by m×d Hamiltonian integral tensors; where m and d iterate
+            over bond-order (σ, π, etc.) and distances respectively.
+         overlap: Dictionary storing the overlap integrals in a manner akin to
+            ``hamiltonian``.
+         grid: Distances at which the ``hamiltonian`` & ``overlap`` elements
+            were evaluated.
+         r_spline: A :class:`.RSpline` object detailing the repulsive
+            spline. [DEFAULT=None]
+         r_poly: A :class:`.RPoly` object detailing the repulsive
+            polynomial. [DEFAULT=None]
+         on_sites: On site terms, homo-atomic systems only. [DEFAULT=None]
+         hubbard_us: Hubbard U terms, homo-atomic systems only. [DEFAULT=None]
+         mass: Atomic mass, homo-atomic systems only. [DEFAULT=None]
+         occupations: Occupations of the orbitals, homo-atomic systems only.
+            [DEFAULT=None]
+
+        Attributes:
+        atom_pair: True if the system contains atomic data, only relevant to
+            the homo-atomic cases.
+        hamiltonian:
+        overlap:
+        hs_cut:
+
+    """
+
+    RSpline = Skf.RSpline
+    RPoly = Skf.RPoly
+
+    def __init__(
+            self, atom_pair: Tensor, hamiltonian: SkDict, overlap: SkDict,
+            grid: Tensor, hs_cutoff, r_spline: Optional[RSpline] = None,
+            r_poly: Optional[RPoly] = None, hubbard_us: OptTens = None,
+            on_sites: OptTens = None, occupations: OptTens = None,
+            mass: OptTens = None):
+        super().__init__(atom_pair, hamiltonian, overlap, grid, hs_cutoff,
+                         r_spline, r_poly, hubbard_us,
+                         on_sites, occupations, mass)
+
+    @classmethod
+    def read(cls, path: Union[List[str], str], atom_pair: Sequence[int] = None,
+             smooth_to_zero: bool = True, **kwargs) -> List['Skf']:
+        """Parse Slater-Koster data from skf files and their binary analogs.
+
+        `path` includes Slater-Koster data with various compression radii,
+        therefore there is no `on_sites` or `hubbard_us`. In this case,
+        `path_homo`, which refers to standard Slater-Koster data, is added
+        to generate `on_sites` or `hubbard_us`. The example of Slater-Koster
+        files name style, C-H_02.00_02.00.skf, C-C_10.00_02.00.skf, where the
+        first, second numbers correspond to the compression radii of first,
+        second elements.
+
+        Arguments:
+            path: Path to the binary file or list of SKF files, the tail of
+                SKF files should satisfy `.skf.nn.nn.nn.nn` type, where `n`
+                is integer number.
+            atom_pair: Atomic numbers of the element pair. This is only used
+                when reading from an HDF5 file with more than one SK entry.
+                [DEFAULT=None]
+            smooth_to_zero: Boolean parameter to decide if smooth the tail
+                for various SKF with different compression radii.
+
+        Keyword Arguments:
+            device: Device on which to place tensors. [DEFAULT=None]
+            dtype: dtype to be used for floating point tensors. [DEFAULT=None]
+            path_homo: Get the atomic data
+
+        Returns:
+            skf: A list of `Skf` object contain all data parsed from the
+                specified file.
+        """
+        if isinstance(path, list):
+
+            compr_list, element_name_list = _split_name_r(path, is_vcr=True)
+            path_homo = kwargs['path_homo']
+            element_name_list_atom = _split_name_r(path_homo, is_vcr=False)
+
+            # unique element pair and their indices
+            element_set = set(element_name_list)
+            ind = [[i for i, ie in enumerate(element_name_list) if ie == ies]
+                   for ies in element_set]
+
+            # loop over all unique element pair
+            _skf = []
+            for ie, idx in zip(element_set, ind):
+
+                # loop over all compression radii
+                _iskf, _compr, kwargs_in = [], [], {}
+                for iid in idx:
+                    _iskf.append(super().read(path[iid], atom_pair,  **kwargs))
+                    _compr.append(compr_list[iid])
+
+                # merge data with various compression radii
+                atom_pair = _iskf[-1].atom_pair
+                nr = int(np.sqrt(len(idx)))  # -> Number of compression radii
+                h_data = {ikey: pack([isk.hamiltonian[ikey] for isk in _iskf])
+                          for ikey in _iskf[-1].hamiltonian.keys()}
+                s_data = {ikey: pack([isk.overlap[ikey] for isk in _iskf])
+                          for ikey in _iskf[-1].overlap.keys()}
+                grid = pack([isk.grid for isk in _iskf])
+
+                _cut = [isk.hs_cutoff for isk in _iskf]
+                assert max(_cut) == min(_cut), \
+                    'Please set all the cutoff as the same, get max value' + \
+                        f'{max(_cut)} and min value {min(_cut)}'
+                hs_cut = _cut[0]
+
+                # smooth the tail of HS in case the size is different
+                if smooth_to_zero:
+                    n_grid = torch.tensor([len(isk.grid) for isk in _iskf])
+                    h_data = {ikey: vcr_poly_to_zero(
+                        grid, h_data[ikey], n_grid) for ikey in h_data.keys()}
+                    s_data = {ikey: vcr_poly_to_zero(
+                        grid, s_data[ikey], n_grid) for ikey in s_data.keys()}
+                h_data = {ikey: h_data[ikey].reshape(nr, nr, h_data[ikey].shape[1], -1)
+                          for ikey in h_data.keys()}
+                s_data = {ikey: s_data[ikey].reshape(nr, nr, s_data[ikey].shape[1], -1)
+                          for ikey in s_data.keys()}
+
+                # update grid after smooth, the grid equals to max grid
+                step = _iskf[-1].grid[..., -1] - _iskf[-1].grid[..., -2]
+                grid = torch.arange(1, h_data[
+                    list(h_data.keys())[0]].shape[-1] + 2) * step
+
+                if _iskf[-1].r_poly is not None:
+                    kwargs_in['r_poly'] = pack([
+                        isk.r_poly for isk in _iskf]).reshape(nr, nr, -1)
+
+                # atomic data from path_homo
+                if ie[0] == ie[1]:
+                    ind = element_name_list_atom.index(ie)
+                    _homo = super().read(path_homo[ind], atom_pair, **kwargs)
+                    for ih in ['mass', 'occupations', 'on_sites', 'hubbard_us']:
+                        kwargs_in[ih] = getattr(_homo, ih)
+
+                if _iskf[-1].r_spline is not None:
+                    r_grid = pack([ii.r_spline.grid for ii in _iskf])
+                    r_cutoff = pack([ii.r_spline.cutoff.unsqueeze(0) for ii in _iskf])
+                    r_spline_coef = pack([ii.r_spline.spline_coef for ii in _iskf])
+                    r_exp_coef = pack([ii.r_spline.exp_coef for ii in _iskf])
+                    r_tail_coef = pack([ii.r_spline.tail_coef for ii in _iskf])
+
+                    kwargs_in['r_spline'] = cls.RSpline(
+                        # Repulsive grid, cutoff & repulsive spline coefficients.
+                        r_grid, r_cutoff, r_spline_coef,
+                        # The exponential and tail spline's coefficients.
+                        r_exp_coef, r_tail_coef)
+
+                _skf.append(cls(atom_pair, h_data, s_data, grid, hs_cut,
+                                **kwargs_in))
+
+            return _skf
+
+        else:
+            return super().read(path, atom_pair, **kwargs)
+
+    def to_hdf5(self, target: Group):
+        """Saves the `Skf` instance into a target HDF5 Group."""
+        super().to_hdf5(target)
+
+    def write(self, path: list, overwrite: Optional[bool] = False):
+        """Writes the `Skf` instance into a target HDF5 Group."""
+        super().write(path, overwrite)
+
+
+class TvcrSkf(Skf):
+    """Two variable compression radii Slater-Koster file parser.
+
+    Arguments:
+         atom_pair: Atomic numbers of the elements associated with the
+            interaction.
+         hamiltonian: Dictionary keyed by azimuthal-number-pairs (ℓ₁, ℓ₂) and
+            valued by m×d Hamiltonian integral tensors; where m and d iterate
+            over bond-order (σ, π, etc.) and distances respectively.
+         overlap: Dictionary storing the overlap integrals in a manner akin to
+            ``hamiltonian``.
+         grid: Distances at which the ``hamiltonian`` & ``overlap`` elements
+            were evaluated.
+         r_spline: A :class:`.RSpline` object detailing the repulsive
+            spline. [DEFAULT=None]
+         r_poly: A :class:`.RPoly` object detailing the repulsive
+            polynomial. [DEFAULT=None]
+         on_sites: On site terms, homo-atomic systems only. [DEFAULT=None]
+         hubbard_us: Hubbard U terms, homo-atomic systems only. [DEFAULT=None]
+         mass: Atomic mass, homo-atomic systems only. [DEFAULT=None]
+         occupations: Occupations of the orbitals, homo-atomic systems only.
+            [DEFAULT=None]
+
+        Attributes:
+        atomic: True if the system contains atomic data, only relevant to the
+            homo-atomic cases.
+
+    """
+
+    RSpline = Skf.RSpline
+    RPoly = Skf.RPoly
+
+    def __init__(
+            self, atom_pair: Tensor, hamiltonian: SkDict, overlap: SkDict,
+            grid: Tensor, hs_cut, r_spline: Optional[RSpline] = None,
+            r_poly: Optional[RPoly] = None, hubbard_us: OptTens = None,
+            on_sites: OptTens = None, occupations: OptTens = None,
+            mass: OptTens = None):
+        super().__init__(atom_pair, hamiltonian, overlap,
+                         grid, hs_cut, r_spline, r_poly, hubbard_us,
+                         on_sites, occupations, mass)
+
+    @classmethod
+    def read(cls, path: Union[List[str], str], path_homo: list = None,
+             atom_pair: Sequence[int] = None,
+             smooth_to_zero: bool = True,
+             write: bool = False, output: str = './tmp.db',
+             overwrite: Optional[bool] = False,
+             **kwargs) -> List['Skf']:
+        """Parse Slater-Koster data from skf files and their binary analogs.
+
+        `path` includes Slater-Koster data with various compression radii,
+        therefore there is no `on_sites` or `hubbard_us`. In this case,
+        `path_homo`, which refers to standard Slater-Koster data, is added
+        to generate `on_sites` or `hubbard_us`. The example of Slater-Koster
+        files name style, C-H_02.00_02.00.skf, C-C_10.00_02.00.skf, where the
+        first, second numbers correspond to the compression radii of first,
+        second elements.
+
+        Arguments:
+            path: Path to the binary file or list of SKF files, the tail of
+                SKF files should satisfy `.skf.nn.nn.nn.nn` type, where `n`
+                is integer number.
+            atom_pair: Atomic numbers of the element pair. This is only used
+                when reading from an HDF5 file with more than one SK entry.
+                [DEFAULT=None]
+            smooth_to_zero: Boolean parameter to decide if smooth the tail
+                for various SKF with different compression radii.
+
+        Keyword Arguments:
+            device: Device on which to place tensors. [DEFAULT=None]
+            dtype: dtype to be used for floating point tensors. [DEFAULT=None]
+            path_homo: Get the atomic data
+
+        Returns:
+            skf: A list of `Skf` object contain all data parsed from the
+                specified file.
+        """
+        if isinstance(path, list):
+            assert path_homo is not None, '`path_homo` is needed to read' + \
+                'on-site data, but get None.'
+            compr_list, element_name_list = _split_name_r(path, is_tvcr=True)
+            element_name_list_atom = _split_name_r(path_homo, is_tvcr=False)
+
+            # unique element pair and their indices
+            element_set = set(element_name_list)
+            ind = [[i for i, ie in enumerate(element_name_list) if ie == ies]
+                   for ies in element_set]
+
+            # loop over all unique element pair
+            _skf = []
+            for ie, idx in zip(element_set, ind):
+
+                # loop over all compression radii
+                _iskf, _compr, kwargs_in = [], [], {}
+                for iid in idx:
+                    _iskf.append(super().read(path[iid], atom_pair, **kwargs))
+                    _compr.append(compr_list[iid])
+
+                # merge data with various compression radii
+                atom_pair = _iskf[-1].atom_pair
+                nr = int(len(idx) ** 0.25)  # -> Number of compression radii
+                h_data = {ikey: pack([isk.hamiltonian[ikey] for isk in _iskf])
+                          for ikey in _iskf[-1].hamiltonian.keys()}
+                s_data = {ikey: pack([isk.overlap[ikey] for isk in _iskf])
+                          for ikey in _iskf[-1].overlap.keys()}
+                grid = pack([isk.grid for isk in _iskf])
+
+                _cut = [isk.hs_cutoff for isk in _iskf]
+                assert max(_cut) == min(_cut), \
+                    'Please set all the cutoff as the same, get max value' + \
+                        f'{max(_cut)} and min value {min(_cut)}'
+                hs_cut = _cut[0]
+
+                # smooth the tail of HS in case the size is different
+                if smooth_to_zero:
+                    n_grid = torch.tensor([len(isk.grid) for isk in _iskf])
+                    h_data = {ikey: vcr_poly_to_zero(
+                        grid, h_data[ikey], n_grid) for ikey in h_data.keys()}
+                    s_data = {ikey: vcr_poly_to_zero(
+                        grid, s_data[ikey], n_grid) for ikey in s_data.keys()}
+                h_data = {ikey: h_data[ikey].reshape(
+                    nr, nr, nr, nr, h_data[ikey].shape[1], -1)
+                          for ikey in h_data.keys()}
+                s_data = {ikey: s_data[ikey].reshape(
+                    nr, nr, nr, nr, s_data[ikey].shape[1], -1)
+                          for ikey in s_data.keys()}
+
+                # update grid after smooth, the grid equals to max grid
+                step = _iskf[-1].grid[..., -1] - _iskf[-1].grid[..., -2]
+                grid = torch.arange(1, h_data[
+                    list(h_data.keys())[0]].shape[-1] + 2) * step
+
+                if _iskf[-1].r_poly is not None:
+                    kwargs_in['r_poly'] = pack([
+                        isk.r_poly for isk in _iskf]).reshape(nr, nr, nr, nr, -1)
+
+                # atomic data from path_homo
+                if ie[0] == ie[1]:
+                    ind = element_name_list_atom.index(ie)
+                    _homo = super().read(path_homo[ind], atom_pair, **kwargs)
+                    for ih in ['mass', 'occupations', 'on_sites', 'hubbard_us']:
+                        kwargs_in[ih] = getattr(_homo, ih)
+
+                if _iskf[-1].r_spline is not None:
+                    r_grid = pack([ii.r_spline.grid for ii in _iskf])
+                    r_cutoff = pack([ii.r_spline.cutoff.unsqueeze(0) for ii in _iskf])
+                    r_spline_coef = pack([ii.r_spline.spline_coef for ii in _iskf])
+                    r_exp_coef = pack([ii.r_spline.exp_coef for ii in _iskf])
+                    r_tail_coef = pack([ii.r_spline.tail_coef for ii in _iskf])
+
+                    kwargs_in['r_spline'] = cls.RSpline(
+                        # Repulsive grid, cutoff & repulsive spline coefficients.
+                        r_grid, r_cutoff, r_spline_coef,
+                        # The exponential and tail spline's coefficients.
+                        r_exp_coef, r_tail_coef)
+
+                this_cls = cls(atom_pair, h_data, s_data, grid, hs_cut, **kwargs_in)
+
+                if write:
+                    this_cls.write(output, overwrite)
+
+                _skf.append(this_cls)
+
+            return _skf
+
+        else:
+            return super().read(path, atom_pair, **kwargs)
+
+    def to_hdf5(self, target: Group):
+        """Saves the `Skf` instance into a target HDF5 Group."""
+        super().to_hdf5(target)
+
+    def write(self, path: list, overwrite: Optional[bool] = False):
+        """Writes the `Skf` instance into a target HDF5 Group."""
+        super().write(path, overwrite)
+
+
 #########################
 # Convenience Functions #
 #########################
@@ -595,3 +962,23 @@ def _esr(text: str) -> str:
             n, val = i.strip(',').split('*')
             text = text.replace(i, f"{' '.join([val] * int(n))}")
     return text
+
+def _split_name_r(path: list, is_vcr: bool = False,
+                  is_tvcr: bool = False) -> Tuple[str, str, Tensor]:
+    """Split skf name with compression radii tail."""
+    e = '[A-Z][a-z]?'
+    element_name = [''.join(re.findall(e, re.search(
+        rf'{e}.?{e}(?=.)', split(ip)[-1]).group(0))) for ip in path]
+
+    if is_vcr:
+        vcr = [torch.tensor([float(ip[-15: -10]), float(ip[-9:-4])])
+               for ip in path]
+        return vcr, element_name
+    elif is_tvcr:
+        vcr = [torch.tensor([
+            float(ip[-27: -22]), float(ip[-21:-16]),
+            float(ip[-15: -10]), float(ip[-9:-4])]) for ip in path]
+        return vcr, element_name
+
+    else:
+        return element_name

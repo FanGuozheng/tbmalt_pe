@@ -73,13 +73,18 @@ def hs_matrix(geometry: Geometry, basis: Basis, sk_feed: SkFeed,
     # between devices and so should always be on the "correct" one.
     mat = torch.zeros(basis.orbital_matrix_shape,  # <- Results matrix
                       device=geometry.positions.device)
+    isperiodic = geometry.isperiodic
 
     # True of the hamiltonian is square (used for safety checks)
     mat_is_square = mat.shape[-1] == mat.shape[-2]
 
     # Matrix Initialisation
-    l_mat_f = basis.azimuthal_matrix(mask_diag=True, mask_on_site=True)
-    l_mat_s = basis.azimuthal_matrix('shell', mask_on_site=True)
+    if not isperiodic:
+        l_mat_f = basis.azimuthal_matrix(mask_diag=True, mask_on_site=True)
+        l_mat_s = basis.azimuthal_matrix('shell', mask_on_site=True)
+    else:
+        l_mat_f = basis.azimuthal_matrix(mask_diag=False, mask_on_site=False)
+        l_mat_s = basis.azimuthal_matrix('shell', mask_on_site=False)
     i_mat_s = basis.index_matrix('shell')
     an_mat_a = basis.atomic_number_matrix('atomic')
     sn_mat_s = basis.shell_number_matrix('shell')
@@ -96,9 +101,9 @@ def hs_matrix(geometry: Geometry, basis: Basis, sk_feed: SkFeed,
         index_mask_s = torch.nonzero((l_mat_s == l_pair).all(dim=-1)).T
 
         # Ignore duplicate operations in the lower triangle when ℓ₁=ℓ₂
-        if l_pair[0] == l_pair[1:] and mat_is_square:
-            # If the matrix is not square this will case many problems!
-            index_mask_s = index_mask_s.T[index_mask_s[0] < index_mask_s[1]].T
+        # if l_pair[0] == l_pair[1:] and mat_is_square and not isperiodic:
+        #     # If the matrix is not square this will case many problems!
+        #     index_mask_s = index_mask_s.T[index_mask_s[0] < index_mask_s[1]].T
 
         if len(index_mask_s[0]) == 0:  # Skip if no l_pair blocks are found
             continue
@@ -112,15 +117,22 @@ def hs_matrix(geometry: Geometry, basis: Basis, sk_feed: SkFeed,
 
         # Gather the atomic numbers, distances, and unit vectors.
         g_anum = an_mat_a[[*index_mask_a]]
-        g_dist = dist_mat_a[[*index_mask_a]]
-        g_vecs = vec_mat_a[[*index_mask_a]]
+        if not isperiodic:
+            g_dist = dist_mat_a[[*index_mask_a]]
+            g_vecs = vec_mat_a[[*index_mask_a]]
+        else:
+            g_dist = dist_mat_a[[*index_mask_a]].T
+            g_dist[g_dist.eq(0)] = 99999
+            _g_v = vec_mat_a.permute(0, 2, 3, 4, 1)[[*index_mask_a]]
+            g_vecs = _g_v.permute(2, 0, 1).reshape(-1, _g_v.shape[1])
 
         # Get off-site integrals from the sk_feed, passing on any kwargs
         # provided by the user. If the SK-feed is environmentally dependent,
         # then it will need the indices of the atoms; as this data cannot be
         # provided by the user it must be explicitly added to the kwargs here.
         integrals = _gather_off_site(g_anum, shell_pairs, g_dist, sk_feed,
-                                     **kwargs, atom_indices=index_mask_a)
+                                     isperiodic, **kwargs,
+                                     atom_indices=index_mask_a)
 
         # Make a call to the relevant Slater-Koster function to get the sk-block
         sk_data = sub_block_rot(l_pair, g_vecs, integrals)
@@ -145,23 +157,50 @@ def hs_matrix(geometry: Geometry, basis: Basis, sk_feed: SkFeed,
         # during the final assignment by flipping the indices.
 
         # Split SK-data into row-wise slices, flatten, then concatenate.
-        groupings = index_mask_s[:-1].unique_consecutive(False, True, 1)[1]
-        groups = split_by_size(sk_data, groupings)
-        sk_data = torch.cat([g.transpose(1, 0).flatten() for g in groups])
+        # groupings = index_mask_s[:-1].unique_consecutive(False, True, 1)[1]
+        # groups = split_by_size(sk_data, groupings)
+        # sk_data = torch.cat([g.transpose(1, 0).flatten() for g in groups])
+        if l_pair[0] != 0:
+            nr, nc = l_pair * 2 + 1  # № of rows/columns of this sub-block
+            # № of sub-blocks in each system.
+            nl = index_mask_s[0].unique(return_counts=True)[1]
+            # Indices of each row
+            r_offset = torch.arange(nr).expand(len(index_mask_s[-1]), nc).T
+            # Index list to order the rows of all ℓ₁-ℓ₂ sub-blocks so that
+            # the results can be assigned back into the H/S tensors without
+            # mangling.
+            r = (r_offset + index_mask_s[-2]).T.flatten().split((
+                nr * nl).tolist())
+            r, _mask = pack(r, value=99, return_mask=True)
+            r = r.cpu().sort(stable=True).indices
+            # Correct the index list.
+            r[1:] = r[1:] + (nl.cumsum(0)[:-1] * nr).unsqueeze(
+                -1).repeat_interleave((r.shape[-1]), dim=-1)
+            r = r[_mask]
+            # The "r" tensor only takes into account the central image, thus
+            # the other images must now be taken into account.
+            n = int(sk_data.nelement() / (r.nelement() * nr))
+            r = (r + (torch.arange(n) * len(r)).view(-1, 1)).flatten()
+            # Perform the reordering
+            sk_data = sk_data.view(-1, nc)[r]
+
+        sk_data = sk_data.flatten()
+
+        if isperiodic:
+            sk_data = sk_data.flatten().reshape(dist_mat_a.shape[-1], -1).sum(0)
 
         # Create the full sized index mask and assign the results.
         a_mask = torch.nonzero((l_mat_f == l_pair).all(-1)).T
-
-        # Mask lower triangle like before (as appropriate)
-        if l_pair[0] == l_pair[1:] and mat_is_square:
-            a_mask = a_mask.T[a_mask[0] < a_mask[1]].T
+        # # Mask lower triangle like before (as appropriate)
+        # if l_pair[0] == l_pair[1:] and mat_is_square and not isperiodic:
+        #     a_mask = a_mask.T[a_mask[0] < a_mask[1]].T
 
         mat[[*a_mask]] = sk_data  # (ℓ_1, ℓ_2) blocks, i.e. the row blocks
         mat.transpose(-1, -2)[[*a_mask]] = sk_data  # (ℓ_2, ℓ_1) column-wise
 
     # Set the onsite terms (diagonal)
-    mat.diagonal(0, -2, -1)[:] = _gather_on_site(geometry, basis, sk_feed,
-                                                 **kwargs)
+    mat.diagonal(0, -2, -1)[:] = mat.diagonal(0, -2, -1)[:] + _gather_on_site(
+        geometry, basis, sk_feed, **kwargs)
     return mat
 
 
@@ -211,7 +250,7 @@ def _gather_on_site(geometry: Geometry, basis: Basis, sk_feed: SkFeed,
 
 def _gather_off_site(
         atom_pairs: Tensor, shell_pairs: Tensor, distances: Tensor,
-        sk_feed: SkFeed, **kwargs) -> Tensor:
+        sk_feed: SkFeed, isperiodic: bool, **kwargs) -> Tensor:
 
     """Retrieves integrals from a target feed in a batch-wise manner.
 
@@ -226,6 +265,7 @@ def _gather_off_site(
         distances: Distances between the atom pairs.
         sk_feed: The Slater-Koster feed entity responsible for providing the
             requisite Slater Koster integrals and on-site terms.
+        isperiodic:
 
     Keyword Arguments:
         kwargs: Surplus `kwargs` are passed into calls made to the ``sk_feed``
@@ -254,9 +294,14 @@ def _gather_off_site(
 
     """
     # Block the passing of vectors, which can cause hard to diagnose issues
-    if distances.ndim >= 2:
-        raise ValueError('Argument "distances" must be a 1d torch.tensor.')
+    if distances.ndim > 2:
+        raise ValueError('Argument "distances" must be a 1d or 2d torch.tensor.')
 
+    if isperiodic:
+        n_cell = distances.shape[0]
+        atom_pairs = atom_pairs.repeat(n_cell, 1)
+        shell_pairs = shell_pairs.repeat(n_cell, 1)
+        distances = distances.flatten()
     integrals = None
 
     # Sort lists so that separate calls are not needed for O-H and H-O
@@ -273,6 +318,9 @@ def _gather_off_site(
     atom_indices = kwargs.get('atom_indices', None)
     if atom_indices is not None:
         del kwargs['atom_indices']
+
+        if isperiodic:
+            atom_indices = atom_indices.repeat(1, n_cell)
 
     # Loop over each of the unique atom_pairs
     for as_pair in as_pairs_u:

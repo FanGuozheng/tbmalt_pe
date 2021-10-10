@@ -1,187 +1,458 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Interpolation for general purpose."""
-from numbers import Real
+"""
+Created on Fri Oct 15 17:32:49 2021
+
+@author: gz_fan
+"""
+
+import bisect
 import torch
+import numpy as np
+from tbmalt.common.batch import pack
 Tensor = torch.Tensor
 
 
-class PolyInterpU:
-    """Polynomial interpolation method with uniform grid points.
+class MultiVarInterp:
+    """"""
 
-    The boundary condition will use `poly_to_zero` function, which make the
-    polynomial values smoothly converge to zero at the boundary.
+    def __init__(self, x: Tensor, y: Tensor, n_dims: int = None):
+        # test x is ascending
+        # test different idm is the same
+        self.x, self.y = self._check(x, y, n_dims)
+
+    def __call__(self, x_new):
+        """"""
+        x_new = x_new.unsqueeze(1) if x_new.dim() == 1 else x_new
+        assert len(x_new) == self.n_dims, '`len(x_new)` and `n_dims` are not equal'
+        x_new[x_new.lt(torch.min(self.x))] = torch.min(self.x)
+        x_new[x_new.gt(torch.max(self.x))] = torch.max(self.x)
+
+        ind_lef = torch.searchsorted(self.x, x_new)
+        mask_max = ind_lef.ge(self.x.shape[1] - 1)
+        ind_rig = ind_lef + 1
+
+        # to make sure index donot exceed shape of the shape x
+        ind_lef[mask_max] = self.x.shape[1] - 1
+        ind_rig[mask_max] = self.x.shape[1] - 1
+
+        # to get the ratio of index between grids
+        _y = self.y
+        for idim in range(self.n_dims):
+            x_ind_lef = self.x[idim][ind_lef[idim]]
+            x_ind_rig = self.x[idim][ind_rig[idim]]
+            grid_len = x_ind_rig - x_ind_lef
+            ratio_lef = (x_new[idim] - x_ind_lef) / grid_len
+            ratio_rig = (x_ind_rig - x_new[idim]) / grid_len
+            _y = _y.transpose(idim, 0)
+            y_lef, y_rig = _y[ind_lef[idim]], _y[ind_rig[idim]]
+
+            _y = y_lef * ratio_lef + y_rig * ratio_rig
+
+        return _y
+
+    def _check(self, x, y, n_dims):
+        assert isinstance(x, Tensor), 'input x should be torch.tensor' + \
+            f' but get {type(x)}'
+        assert isinstance(y, Tensor), 'input y should be torch.tensor' + \
+            f' but get {type(y)}'
+
+        self.n_dims = y.dim() if n_dims is None else n_dims
+        if x.dim() == 1:
+            x = x.repeat(self.n_dims, 1)
+        else:
+            assert len(x) == self.n_dims
+
+        return x, y
+
+
+class BicubInterp:
+    """Vectorized bicubic interpolation method designed for molecule.
+
+    The bicubic interpolation is designed to interpolate the integrals of
+    whole molecule. The xmesh, ymesh are the grid points and they are the same,
+    therefore only xmesh is needed here.
+    The zmesh is a 4D or 5D Tensor. The 1st, 2nd dimensions are corresponding
+    to the pairwise atoms in molecule. The 3rd and 4th are corresponding to
+    the xmesh and ymesh. The 5th dimension is optional. For bicubic
+    interpolation of single integral such as ss0 orbital, it is 4D Tensor.
+    For bicubic interpolation of all the orbital integrals, zmesh is 5D Tensor.
 
     Arguments:
-        xx: Grid points for interpolation, 1D Tensor.
-        yy: Values to be interpolated at each grid point.
-        tail: Distance to smooth the tail.
-        delta_r: Delta distance for 1st, 2nd derivative.
-        n_interp: Number of total interpolation grid points.
-        n_interp_r: Number of right side interpolation grid points.
+        xmesh: 1D Tensor.
+        zmesh: 2D or 3D Tensor, 2D is for single integral with vrious
+            compression radii, 3D is for multi integrals.
 
-    Attributes:
-        xx: Grid points for interpolation, 1D Tensor.
-        yy: Values to be interpolated at each grid point.
-        delta_r: Delta distance for 1st, 2nd derivative.
-        tail: Distance to smooth the tail.
-        n_interp: Number of total interpolation grid points.
-        n_interp_r: Number of right side interpolation grid points.
-        grid_step: Distance between each gird points.
-
-    Notes:
-        The `PolyInterpU` class, which is taken from the DFTB+, assumes a
-        uniform grid. Here, the yy and xx arguments are the values to be
-        interpolated and their associated grid points respectively. The tail
-        end of the spline is smoothed to zero, meaning that extrapolated
-        points will rapidly, but smoothly, decay to zero.
-
+    References:
+        .. [wiki] https://en.wikipedia.org/wiki/Bicubic_interpolation
     """
 
-    def __init__(self, xx: Tensor, yy: Tensor, tail: Real = 1.0,
-                 delta_r: Real = 1E-5, n_interp: int = 8, n_interp_r: int = 4):
-        self.xx = xx
-        self.yy = yy
-        self.delta_r = delta_r
+    def __init__(self, xmesh: Tensor, zmesh: Tensor, hs_grid=None):
+        """Get interpolation with two variables."""
+        if zmesh.dim() < 2:
+            raise ValueError('zmesh dim should >= 2')
+        if zmesh.dim() == 2:
+            zmesh = zmesh.unsqueeze(0)  # -> single to batch
 
-        self.tail = tail
-        self.n_interp = n_interp
-        self.n_interp_r = n_interp_r
-        self.grid_step = xx[1] - xx[0]
+        self.xmesh = xmesh
+        self.zmesh = zmesh
+        self.hs_grid = hs_grid
 
-        # Device type of the tensor in this class
-        self._device = xx.device
-
-        # Check xx is uniform & that len(xx) > n_interp
-        dxs = xx[1:] - xx[:-1]
-        check_1 = torch.allclose(dxs, torch.full_like(dxs, self.grid_step))
-        assert check_1, 'Grid points xx are not uniform'
-        if len(xx) < n_interp:
-            raise ValueError(f'`n_interp` ({n_interp}) exceeds the number of'
-                             f'data points `xx` ({len(xx)}).')
-
-    def __call__(self, rr: Tensor) -> Tensor:
-        """Get interpolation according to given rr.
+    def __call__(self, xnew: Tensor, distance=None):
+        """Calculate bicubic interpolation.
 
         Arguments:
-            rr: interpolation points for single and batch.
-
-        Returns:
-            result: Interpolation values with given rr.
-
+            xnew: the interpolation points of atom-pairs in molecule, it can be
+                single atom-pair or multi atom-pairs.
         """
-        n_grid_point = len(self.xx)  # -> number of grid points
-        r_max = (n_grid_point - 1) * self.grid_step + self.tail
-        ind = torch.floor(rr / self.grid_step).long().to(self._device)
-        result = torch.zeros(*rr.shape, device=self._device)
+        assert xnew.dim() <= 2
+        self.xi = xnew if xnew.dim() == 2 else xnew.unsqueeze(0)  # -> to batch
+        self.atp = self.xi.shape[0]  # number of atom pairs
+        self.arange_atp = torch.arange(self.atp)
+
+        if distance is not None:  # with DFTB+ distance interpolation
+            assert self.hs_grid is not None  # -> grid mesh for distance
+            pdim = [2, 0, 1] if self.zmesh.dim() == 3 else [2, 3, 0, 1]
+            zmesh = self.zmesh.permute(pdim)
+            ski = PolyInterpU(self.hs_grid, zmesh)
+            zmesh = ski(distance)
+        else:
+            zmesh = self.zmesh
+
+        coeff = torch.tensor([[1., 0., 0., 0.], [0., 0., 1., 0.],
+                              [-3., 3., -2., -1.], [2., -2., 1., 1.]])
+        coeff_ = torch.tensor([[1., 0., -3., 2.], [0., 0., 3., -2.],
+                               [0., 1., -2., 1.], [0., 0., -1., 1.]])
+
+        # get the nearest grid points, 1st and second neighbour indices of xi
+        self._get_indices()
+
+        # this is to transfer x to fraction and its square, cube
+        x_fra = (self.xi - self.xmesh[self.nx0]) / (
+            self.xmesh[self.nx1] - self.xmesh[self.nx0])
+        xmat = torch.stack([x_fra ** 0, x_fra ** 1, x_fra ** 2, x_fra ** 3])
+
+        # get four nearest grid points values, each will be: [natom, natom, 20]
+        f00, f10, f01, f11 = self._fmat0th(zmesh)
+
+        # get four nearest grid points derivative over x, y, xy
+        f02, f03, f12, f13, f20, f21, f30, f31, f22, f23, f32, f33 = \
+            self._fmat1th(zmesh, f00, f10, f01, f11)
+        fmat = torch.stack([torch.stack([f00, f01, f02, f03]),
+                            torch.stack([f10, f11, f12, f13]),
+                            torch.stack([f20, f21, f22, f23]),
+                            torch.stack([f30, f31, f32, f33])])
+
+        pdim = [2, 0, 1] if fmat.dim() == 3 else [2, 3, 0, 1]
+        a_mat = torch.matmul(torch.matmul(coeff, fmat.permute(pdim)), coeff_)
+
+        return torch.stack([torch.matmul(torch.matmul(
+            xmat[:, i, 0], a_mat[i]), xmat[:, i, 1]) for i in range(self.atp)])
+
+    def _get_indices(self):
+        """Get indices and repeat indices."""
+        self.nx0 = torch.searchsorted(self.xmesh, self.xi.detach()) - 1
+
+        # get all surrounding 4 grid points indices and repeat indices
+        self.nind = torch.tensor([ii for ii in range(self.atp)])
+        self.nx1 = torch.clamp(torch.stack([ii + 1 for ii in self.nx0]), 0,
+                               len(self.xmesh) - 1)
+        self.nx_1 = torch.clamp(torch.stack([ii - 1 for ii in self.nx0]), 0)
+        self.nx2 = torch.clamp(torch.stack([ii + 2 for ii in self.nx0]), 0,
+                               len(self.xmesh) - 1)
+
+    def _fmat0th(self, zmesh: Tensor):
+        """Construct f(0/1, 0/1) in fmat."""
+        f00 = zmesh[self.arange_atp, self.nx0[..., 0], self.nx0[..., 1]]
+        f10 = zmesh[self.arange_atp, self.nx1[..., 0], self.nx0[..., 1]]
+        f01 = zmesh[self.arange_atp, self.nx0[..., 0], self.nx1[..., 1]]
+        f11 = zmesh[self.arange_atp, self.nx1[..., 0], self.nx1[..., 1]]
+        return f00, f10, f01, f11
+
+    def _fmat1th(self, zmesh: Tensor, f00: Tensor, f10: Tensor, f01: Tensor,
+                 f11: Tensor):
+        """Get the 1st derivative of four grid points over x, y and xy."""
+        f_10 = zmesh[self.arange_atp, self.nx_1[..., 0], self.nx0[..., 1]]
+        f_11 = zmesh[self.arange_atp, self.nx_1[..., 0], self.nx1[..., 1]]
+        f0_1 = zmesh[self.arange_atp, self.nx0[..., 0], self.nx_1[..., 1]]
+        f02 = zmesh[self.arange_atp, self.nx0[..., 0], self.nx2[..., 1]]
+        f1_1 = zmesh[self.arange_atp, self.nx1[..., 0], self.nx_1[..., 1]]
+        f12 = zmesh[self.arange_atp, self.nx1[..., 0], self.nx2[..., 1]]
+        f20 = zmesh[self.arange_atp, self.nx2[..., 0], self.nx0[..., 1]]
+        f21 = zmesh[self.arange_atp, self.nx2[..., 0], self.nx1[..., 1]]
+
+        # calculate the derivative: (F(1) - F(-1) / (2 * grid)
+        fy00 = (f01 - f0_1) / (self.nx1[..., 1] - self.nx_1[..., 1])
+        fy01 = (f02 - f00) / (self.nx2[..., 1] - self.nx0[..., 1])
+        fy10 = (f11 - f1_1) / (self.nx1[..., 1] - self.nx_1[..., 1])
+        fy11 = (f12 - f10) / (self.nx2[..., 1] - self.nx0[..., 1])
+        fx00 = (f10 - f_10) / (self.nx1[..., 0] - self.nx_1[..., 0])
+        fx01 = (f20 - f00) / (self.nx2[..., 0] - self.nx0[..., 0])
+        fx10 = (f11 - f_11) / (self.nx1[..., 0] - self.nx_1[..., 0])
+        fx11 = (f21 - f01) / (self.nx2[..., 0] - self.nx0[..., 0])
+        fxy00, fxy11 = fy00 * fx00, fx11 * fy11
+        fxy01, fxy10 = fx01 * fy01, fx10 * fy10
+        return fy00, fy01, fy10, fy11, fx00, fx01, fx10, fx11, fxy00, fxy01, fxy10, fxy11
+
+
+class Spline1d:
+    """Polynomial natural (linear, cubic) non-periodic spline.
+
+    Arguments:
+        x: 1D Tensor variable.
+        y: 1D (single) or 2D (batch) Tensor variable.
+
+    Keyword Args:
+        kind: Define spline method, 'cubic' or 'linear'.
+        abcd: 0th, 1st, 2nd and 3rd order parameters in cubic spline.
+
+    References:
+        .. [wiki] https://en.wikipedia.org/wiki/Spline_(mathematics)
+
+    Examples:
+        >>> import tbmalt.common.maths.interpolator as interp
+        >>> import torch
+        >>> x = torch.linspace(1, 10, 10)
+        >>> y = torch.sin(x)
+        >>> fit = interp.Spline1d(x, y)
+        >>> fit(torch.tensor([3.5]))
+        >>> tensor([-0.3526])
+        >>> torch.sin(torch.tensor([3.5]))
+        >>> tensor([-0.3508])
+    """
+
+    def __init__(self, xx: Tensor, yy: Tensor, **kwargs):
+        self.xp, self.yp = xx, yy.T
+        self.kind = kwargs.get('kind', 'cubic')
+
+        if self.kind == 'cubic':
+            if kwargs.get('abcd') is not None:
+                self.aa, self.bb, self.cc, self.dd = kwargs.get('abcd')
+            else:
+                self.aa, self.bb, self.cc, self.dd = self._get_abcd()
+            self.abcd = pack([self.aa, self.bb, self.cc, self.dd])
+        elif self.kind != 'linear':
+            raise NotImplementedError('%s not implemented' % self.kind)
+
+    def __call__(self, xnew: Tensor):
+        """Evaluate the polynomial linear or cubic spline.
+        Arguments:
+            xnew: 0D Tensor.
+        Returns:
+            ynew: 0D Tensor.
+        """
+        # according to the order to choose spline method
+        self.xnew = xnew
+        self.knot = [ii in self.xp for ii in self.xnew]
+
+        # boundary condition of xnew,  xp[0] < xnew
+        assert self.xnew.ge(self.xp[0]).all()
+        self.mask = self.xnew.lt(self.xp[-1])
+
+        # get the nearest grid point index of d in x
+        self.dind = [
+            bisect.bisect(self.xp.detach().numpy(), ii.detach().numpy()) - 1
+            for ii in self.xnew[self.mask]]
+
+        if self.kind == 'cubic':
+            return self._cubic()
+        elif self.kind == 'linear':
+            return self._linear()
+
+    def _linear(self):
+        """Calculate linear interpolation."""
+        return self.yp[self.ind] + (self.xnew - self.xp[self.dind]) / (
+            self.xp[1:] - self.xp[:-1])[self.dind] * (
+            self.yp[..., 1:] - self.yp[..., :-1])[self.ind]
+
+    def _cubic(self):
+        """Calculate cubic spline interpolation."""
+        aa, bb, cc, dd = self.abcd[0], self.abcd[1], self.abcd[2], self.abcd[3]
+
+        # calculate a, b, c, d parameters, need input x and y
+        dx = self.xnew[self.mask] - self.xp[self.dind]
+        _intergal = aa[..., self.dind] + bb[..., self.dind] * dx + \
+            cc[..., self.dind] * dx ** 2 + dd[..., self.dind] * dx ** 3
+
+        return _intergal.transpose(-1, 0) if _intergal.dim() > 1 else _intergal
+
+    def _get_abcd(self):
+        """Get parameter aa, bb, cc, dd for cubic spline interpolation."""
+        # get the first dim of x
+        nx = self.xp.shape[0]
+        assert nx > 3  # the length of x variable must > 3
+
+        # get the differnce between grid points
+        dxp = self.xp[1:] - self.xp[:-1]
+        dyp = self.yp[..., 1:] - self.yp[..., :-1]
+
+        # get b, c, d from reference website: step 3~9, first calculate c
+        A = torch.zeros(nx, nx)
+        A.diagonal()[1:-1] = 2 * (dxp[:-1] + dxp[1:])  # diag
+        A[torch.arange(nx - 1), torch.arange(nx - 1) + 1] = dxp  # off-diag
+        A[torch.arange(nx - 1) + 1, torch.arange(nx - 1)] = dxp
+        A[0, 0], A[-1, -1] = 1., 1.
+        A[0, 1], A[1, 0] = 0., 0.   # natural condition
+        A[-1, -2], A[-2, -1] = 0., 0.
+
+        B = torch.zeros(*self.yp.shape)
+        B[..., 1:-1] = 3 * (dyp[..., 1:] / dxp[1:] - dyp[..., :-1] / dxp[:-1])
+        B = B.permute(1, 0) if B.dim() == 2 else B
+
+        cc, _ = torch.lstsq(B, A)
+        cc = cc.permute(1, 0) if cc.dim() == 2 else cc.unsqueeze(0)
+        bb = dyp / dxp - dxp * (cc[..., 1:] + 2 * cc[..., :-1]) / 3
+        dd = (cc[..., 1:] - cc[..., :-1]) / (3 * dxp)
+        return self.yp, bb, cc, dd
+
+class PolyInterpU:
+    """Interpolation method for SK tables.
+
+    Arguments:
+        xx: Grid points of distances.
+        yy: Integral tables.
+    """
+
+    def __init__(self, xx: Tensor, yy: Tensor):
+        self.yy = yy
+        self.incr = xx[1] - xx[0]
+        self.ngridpoint = len(xx)
+
+    def __call__(self, rr: Tensor, ninterp=8, delta_r=1E-5, tail=1) -> Tensor:
+        """Interpolation SKF according to distance from integral tables.
+
+        Arguments:
+            rr: interpolation points for batch.
+            ninterp: Number of total interpolation grid points.
+            delta_r: Delta distance for 1st, 2nd derivative.
+            tail: Distance to smooth the tail, unit is bohr.
+        """
+        ntail = int(tail / self.incr)
+        rmax = (self.ngridpoint - 1) * self.incr + tail
+        ind = (rr / self.incr).int()
+        result = torch.zeros(rr.shape) if self.yy.dim() == 1 else torch.zeros(
+            rr.shape[0], *self.yy.shape[1:])
+
+        # thye input SKF must have more than 8 grid points
+        if self.ngridpoint < ninterp + 1:
+            raise ValueError("Not enough grid points for interpolation!")
 
         # => polynomial fit
-        if (ind <= n_grid_point).any():
-            _mask = ind <= n_grid_point
+        # if (ind <= self.ngridpoint).any():
+        if (ind <= self.ngridpoint).any():
+            _mask = ind <= self.ngridpoint
 
             # get the index of rr in grid points
-            ind_last = (ind[_mask] + self.n_interp_r + 1).long()
-            ind_last[ind_last > n_grid_point] = n_grid_point
-            ind_last[ind_last < self.n_interp + 1] = self.n_interp + 1
+            ind_last = (ind[_mask] + ninterp / 2 + 1).int()
+            ind_last[ind_last > self.ngridpoint] = self.ngridpoint
+            ind_last[ind_last < ninterp] = ninterp
 
-            # gather xx and yy for both single and batch
-            xa = (ind_last.unsqueeze(1) - self.n_interp +
-                  torch.arange(self.n_interp, device=self._device)) * self.grid_step
-            yb = torch.stack([self.yy[ii - self.n_interp - 1: ii - 1]
-                              for ii in ind_last]).to(self._device)
-            result[_mask] = poly_interp(xa, yb, rr[_mask])
+            xa = (ind_last.unsqueeze(1) - ninterp + torch.arange(ninterp)
+                  ) * self.incr  # get the interpolation gird points
+            yb = torch.stack([self.yy[ii - ninterp - 1: ii - 1]
+                              for ii in ind_last])  # grid point values
+            result[_mask] = poly_interp_2d(xa, yb, rr[_mask])
 
         # Beyond the grid => extrapolation with polynomial of 5th order
-        max_ind = n_grid_point - 1 + int(self.tail / self.grid_step)
-        is_tail = ind.masked_fill(ind.ge(n_grid_point) * ind.le(max_ind), -1).eq(-1)
+        max_ind = self.ngridpoint - 1 + int(tail / self.incr)
+        is_tail = ind.masked_fill(ind.ge(self.ngridpoint) * ind.le(max_ind), -1).eq(-1)
         if is_tail.any():
-            dr = rr[is_tail] - r_max
-            ilast = n_grid_point
+            dr = rr[is_tail] - rmax
+
+            # For input integrals, it will be 2D, such as (nsize) * (pp0, pp1),
+            # initial dr is 1D and will result in errors
+            dr = dr.repeat(self.yy.shape[1], 1).T if self.yy.dim() == 2 else dr
+            ilast = self.ngridpoint
 
             # get grid points and grid point values
-            xa = (ilast - self.n_interp + torch.arange(
-                self.n_interp, device=self._device)) * self.grid_step
-            yb = self.yy[ilast - self.n_interp - 1: ilast - 1]
+            xa = (ilast - ninterp + torch.arange(ninterp)) * self.incr
+            yb = self.yy[ilast - ninterp - 1: ilast - 1]
             xa = xa.repeat(dr.shape[0]).reshape(dr.shape[0], -1)
             yb = yb.unsqueeze(0).repeat_interleave(dr.shape[0], dim=0)
 
             # get derivative
-            y0 = poly_interp(xa, yb, xa[:, self.n_interp - 1] - self.delta_r)
-            y2 = poly_interp(xa, yb, xa[:, self.n_interp - 1] + self.delta_r)
+            y0 = poly_interp_2d(xa, yb, xa[:, ninterp - 1] - delta_r)
+            y2 = poly_interp_2d(xa, yb, xa[:, ninterp - 1] + delta_r)
             y1 = self.yy[ilast - 2]
-            y1p = (y2 - y0) / (2.0 * self.delta_r)
-            y1pp = (y2 + y0 - 2.0 * y1) / (self.delta_r * self.delta_r)
+            y1p = (y2 - y0) / (2.0 * delta_r)
+            y1pp = (y2 + y0 - 2.0 * y1) / (delta_r * delta_r)
 
-            result[is_tail] = poly_to_zero(
-                dr, -1.0 * self.tail, -1.0 / self.tail, y1, y1p, y1pp)
+            if y1pp.dim() == 3:  # -> compression radii, not good
+                dr = dr.repeat(y1pp.shape[1], y1pp.shape[2], 1).transpose(-1, 0)
+
+            result[is_tail] = poly5_zero(y1, y1p, y1pp, dr, -1.0 * tail)
 
         return result
 
 
-def poly_to_zero(xx: Tensor, dx: Tensor, inv_dist: Tensor,
-                 y0: Tensor, y0p: Tensor, y0pp: Tensor) -> Tensor:
-    """Get interpolation if beyond the grid range with 5th order polynomial.
+def smooth_tail_batch(xx: Tensor, yy: Tensor, n_grid: Tensor, ninterp=8,
+                      delta_r=1E-5, tail=1.0):
+    """Smooth the tail with input xx and yy."""
+    assert xx.dim() == 2
+    assert yy.dim() == 3
+    assert n_grid.shape[0] == xx.shape[0]
 
-    Arguments:
-        y0: Values to be interpolated at each grid point.
-        y0p: First derivative of y0.
-        y0pp: Second derivative of y0.
-        xx: Grid points.
-        dx: The grid point range for y0 and its derivative.
+    ilast = n_grid.clone()
+    incr = xx[0, 1] - xx[0, 0]
 
-    Returns:
-        yy: The interpolation values with given xx points in the tail.
+    # get grid points and grid point values
+    xa = (ilast.unsqueeze(1) - ninterp + torch.arange(ninterp)) * incr
+    yb = torch.stack([yy[ii, il - ninterp - 1: il - 1]
+                      for ii, il in enumerate(ilast)])
 
-    Notes:
-        The function `poly_to_zero` realize the interpolation of the points
-        beyond the range of grid points, which make the polynomial values
-        smoothly converge to zero at the boundary. The variable dx determines
-        the point to be zero. This code is consistent with the function
-        `poly5ToZero` in DFTB+.
+    # return smooth grid points in the tail for each SKF
+    dr = -torch.linspace(4, 0, 5) * incr
 
-    """
+    # get derivative
+    y0 = poly_interp_2d(xa, yb, xa[:, ninterp - 1] - delta_r)
+    y2 = poly_interp_2d(xa, yb, xa[:, ninterp - 1] + delta_r)
+    y1 = yy[torch.arange(yy.shape[0]), ilast - 2]
+    y1p = (y2 - y0) / (2.0 * delta_r)
+    y1pp = (y2 + y0 - 2.0 * y1) / (delta_r * delta_r)
+    # dr = dr.unsqueeze(1).unsqueeze(2).repeat(1, y0.shape[0], y0.shape[1])
+    integral_tail = poly5_zero(
+        y1.unsqueeze(-1), y1p.unsqueeze(-1), y1pp.unsqueeze(-1), dr, -tail).permute(0, 2, 1)
+
+    for ii, iy in enumerate(yy):  # -> add tail
+        yy[ii, n_grid[ii]: n_grid[ii] + 5] = integral_tail[ii]
+
+    return yy
+
+
+def poly5_zero(y0: Tensor, y0p: Tensor, y0pp: Tensor, xx: Tensor,
+               dx: Tensor) -> Tensor:
+    """Get integrals if beyond the grid range with 5th polynomial."""
     dx1 = y0p * dx
     dx2 = y0pp * dx * dx
     dd = 10.0 * y0 - 4.0 * dx1 + 0.5 * dx2
     ee = -15.0 * y0 + 7.0 * dx1 - 1.0 * dx2
     ff = 6.0 * y0 - 3.0 * dx1 + 0.5 * dx2
-    xr = xx * inv_dist
+    xr = xx / dx
     yy = ((ff * xr + ee) * xr + dd) * xr * xr * xr
-
     return yy
 
 
-def poly_interp(xp: Tensor, yp: Tensor, rr: Tensor) -> Tensor:
-    """Interpolation with given uniform grid points.
+def poly_interp_2d(xp: Tensor, yp: Tensor, rr: Tensor) -> Tensor:
+    """Interpolate from DFTB+ (lib_math) with uniform grid.
 
     Arguments:
-        xp: The grid points, 2D Tensor, first dimension is for different
-            system and second is for the corresponding grids in each system.
-        yp: The values at the gird points.
-        rr: Points to be interpolated.
-
-    Returns:
-        yy: Interpolation values corresponding to input rr.
-
-    Notes:
-        The function `poly_interp` is designed for both single and multi
-        systems interpolation. Therefore xp will be 2D Tensor.
-
+        xp: 2D tensor, 1st dimension if batch size, 2nd is grid points.
+        yp: 2D tensor of integrals.
+        rr: interpolation points.
     """
-    assert xp.dim() == 2, 'xp is not 2D Tensor'
-    device = xp.device
     nn0, nn1 = xp.shape[0], xp.shape[1]
-    index_nn0 = torch.arange(nn0, device=device)
-    icl = torch.zeros(nn0, device=device).long()
+    index_nn0 = torch.arange(nn0)
+    icl = torch.zeros(nn0).long()
     cc, dd = yp.clone(), yp.clone()
     dxp = abs(rr - xp[index_nn0, icl])
 
     # find the most close point to rr (single atom pair or multi pairs)
-    _mask, ii = torch.zeros(len(rr), device=device) == 0.0, 0.0
-    _dx_new = abs(rr - xp[index_nn0, 0])
-    while (_dx_new < dxp).any():
+    _mask, ii = torch.zeros(len(rr)) == 0, 0
+    dxNew = abs(rr - xp[index_nn0, 0])
+    while (dxNew < dxp).any():
         ii += 1
-        assert ii < nn1 - 1, 'index ii range from 0 to %s' % nn1 - 1
-        _mask = _dx_new < dxp
+        assert ii < nn1 - 1  # index ii range from 0 to nn1 - 1
+        _mask = dxNew < dxp
         icl[_mask] = ii
         dxp[_mask] = abs(rr - xp[index_nn0, ii])[_mask]
 
@@ -189,15 +460,15 @@ def poly_interp(xp: Tensor, yp: Tensor, rr: Tensor) -> Tensor:
 
     for mm in range(nn1 - 1):
         for ii in range(nn1 - mm - 1):
-            r_tmp0 = xp[index_nn0, ii] - xp[index_nn0, ii + mm + 1]
+            rtmp0 = xp[index_nn0, ii] - xp[index_nn0, ii + mm + 1]
 
             # use transpose to realize div: (N, M, K) / (N)
-            r_tmp1 = ((cc[index_nn0, ii + 1] - dd[index_nn0, ii]).transpose(
-                0, -1) / r_tmp0).transpose(0, -1)
+            rtmp1 = ((cc[index_nn0, ii + 1] - dd[index_nn0, ii]).transpose(
+                0, -1) / rtmp0).transpose(0, -1)
             cc[index_nn0, ii] = ((xp[index_nn0, ii] - rr) *
-                                 r_tmp1.transpose(0, -1)).transpose(0, -1)
+                                 rtmp1.transpose(0, -1)).transpose(0, -1)
             dd[index_nn0, ii] = ((xp[index_nn0, ii + mm + 1] - rr) *
-                                 r_tmp1.transpose(0, -1)).transpose(0, -1)
+                                 rtmp1.transpose(0, -1)).transpose(0, -1)
         if (2 * icl < nn1 - mm - 1).any():
             _mask = 2 * icl < nn1 - mm - 1
             yy[_mask] = (yy + cc[index_nn0, icl])[_mask]
@@ -205,5 +476,91 @@ def poly_interp(xp: Tensor, yp: Tensor, rr: Tensor) -> Tensor:
             _mask = 2 * icl >= nn1 - mm - 1
             yy[_mask] = (yy + dd[index_nn0, icl - 1])[_mask]
             icl[_mask] = icl[_mask] - 1
-
     return yy
+
+
+def poly_to_zero(xx: Tensor, yy: Tensor, ninterp=8, delta_r=1E-5, tail=1.0):
+    """Smooth the tail with input xx and yy with various compression radii.
+
+    Arguments:
+        xx:
+        yy:
+
+    """
+    assert xx.dim() == 1
+    assert yy.dim() == 2
+    ny1, ny2 = yy.shape
+
+    # _yy = yy.permute(0, -1, -2)  # -> permute distance dim from last to second
+    ilast = len(xx)
+    incr = xx[1] - xx[0]  # uniform grid points
+
+    # get grid points and grid point values
+    xa = (ilast - ninterp + torch.arange(ninterp)).repeat(ny1, 1) * incr
+    yb = yy[..., ilast - ninterp - 1: ilast - 1]
+
+    # return smooth grid points in the tail for each SKF
+    dr = -torch.linspace(4, 0, 5).repeat(1, ny1).T * incr
+
+    # get derivative
+    y0 = poly_interp_2d(xa, yb, xa[..., ninterp - 1] - delta_r)
+    y2 = poly_interp_2d(xa, yb, xa[..., ninterp - 1] + delta_r)
+    y1 = yy[..., ilast - 2]
+    y1p = (y2 - y0) / (2.0 * delta_r)
+    y1pp = (y2 + y0 - 2.0 * y1) / (delta_r * delta_r)
+    integral_tail = poly5_zero(y1, y1p, y1pp, dr, -1.0 * tail)
+
+    size_tail = integral_tail.T.shape[-1]
+    ynew = torch.zeros(yy.shape[0], yy.shape[1] + size_tail)
+
+    ynew[..., :yy.shape[1]] = yy
+    ynew[..., -size_tail:] = integral_tail.T
+
+    return ynew
+
+
+def vcr_poly_to_zero(xx: Tensor, yy: Tensor, n_grid: Tensor, ninterp=8,
+                      delta_r=1E-5, tail=1.0):
+    """Smooth the tail with input xx and yy with various compression radii.
+
+    Arguments:
+        xx:
+        yy:
+
+    """
+    assert xx.dim() == 2
+    assert yy.dim() == 3
+    assert n_grid.shape[0] == xx.shape[0]
+    ny1, ny2, ny3 = yy.shape
+
+    _yy = yy.permute(0, -1, -2)  # -> permute distance dim from last to second
+    ilast = n_grid.clone()
+    incr = xx[0, 1] - xx[0, 0]
+
+    # get grid points and grid point values
+    xa = (ilast.unsqueeze(1) - ninterp + torch.arange(ninterp)) * incr
+    yb = torch.stack([_yy[ii, il - ninterp - 1: il - 1]
+                      for ii, il in enumerate(ilast)])
+
+    # return smooth grid points in the tail for each SKF
+    dr = -torch.linspace(4, 0, 5) * incr
+
+    # get derivative
+    y0 = poly_interp_2d(xa, yb, xa[:, ninterp - 1] - delta_r)
+    y2 = poly_interp_2d(xa, yb, xa[:, ninterp - 1] + delta_r)
+    y1 = _yy[torch.arange(_yy.shape[0]), ilast - 2]
+    y1p = (y2 - y0) / (2.0 * delta_r)
+    y1pp = (y2 + y0 - 2.0 * y1) / (delta_r * delta_r)
+    integral_tail = poly_to_zero(
+        dr, -1.0 * tail, -1.0 / tail, y1.unsqueeze(-1), y1p.unsqueeze(-1), y1pp.unsqueeze(-1)).permute(0, 2, 1)
+
+    if _yy.shape[1] == max(n_grid):
+        ynew = torch.zeros(ny1, ny3 + integral_tail.shape[1], ny2)
+        ynew[:ny1, :ny3, :ny2] = _yy[:ny1, :ny3, :ny2]
+    else:
+        ynew = _yy.clone()
+
+    for ii, iy in enumerate(_yy):  # -> add tail
+        ynew[ii, n_grid[ii]: n_grid[ii] + 5] = integral_tail[ii]
+
+    return ynew.permute(0, -1, -2)

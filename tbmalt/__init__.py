@@ -9,3 +9,7 @@ from tbmalt.common.exceptions import *
 # Pull data structure classes up to the tbmalt top level domain namespace
 from tbmalt.structures.geometry import Geometry
 from tbmalt.structures.basis import Basis
+from tbmalt.ml.skfeeds import SkfFeed
+from tbmalt.ml.skparamfeed import SkfParamFeed
+from tbmalt.physics.dftb.slaterkoster import hs_matrix
+from tbmalt.physics.dftb.dftb import Dftb1, Dftb2

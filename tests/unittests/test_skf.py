@@ -27,7 +27,7 @@ def skf_files():
             has_r_poly: True if the file contains a valid repulsive polynomial.
             has_r_spline: True if the file contains a repulsive spline.
     """
-    path = 'tests/unittests/data/io/skf'
+    path = 'tests/unittests/data/slko/Au_skf'
     files = {'File_1_Au-Au.skf': (True, True, True),
              'File_2_Au-Au.skf': (True, True, True),
              'File_3_Au-Au.skf': (False, True, True),
