@@ -442,7 +442,8 @@ def batch_chemical_symbols(atomic_numbers: Union[Tensor, List[Tensor]]
         return [s[m].tolist() for s, m in zip(symbols, mask)]
 
 
-def unique_atom_pairs(geometry: Geometry) -> Tensor:
+def unique_atom_pairs(geometry: Optional[Geometry] = None,
+                      unique_atomic_numbers: Optional[Tensor] = None) -> Tensor:
     """Returns a tensor specifying all unique atom pairs.
 
     This takes `Geometry` instance and identifies all atom pairs. This use
@@ -455,7 +456,13 @@ def unique_atom_pairs(geometry: Geometry) -> Tensor:
     Returns:
         unique_atom_pairs: A tensor specifying all unique atom pairs.
     """
-    uan = geometry.unique_atomic_numbers()
+    if geometry is not None:
+        uan = geometry.unique_atomic_numbers()
+    elif unique_atomic_numbers is not None:
+        uan = unique_atomic_numbers
+    else:
+        raise ValueError('Both geometry and unique_atomic_numbers are None.')
+
     n_global = len(uan)
     return torch.stack([uan.repeat(n_global),
                         uan.repeat_interleave(n_global)]).T

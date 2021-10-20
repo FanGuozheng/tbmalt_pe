@@ -611,7 +611,9 @@ class VcrSkf(Skf):
                          on_sites, occupations, mass)
 
     @classmethod
-    def read(cls, path: Union[List[str], str], atom_pair: Sequence[int] = None,
+    def read(cls, path: Union[List[str], str],
+             atom_pair: Sequence[int] = None,
+             path_homo: Union[List[str], str] = None,
              smooth_to_zero: bool = True, **kwargs) -> List['Skf']:
         """Parse Slater-Koster data from skf files and their binary analogs.
 
@@ -642,98 +644,96 @@ class VcrSkf(Skf):
             skf: A list of `Skf` object contain all data parsed from the
                 specified file.
         """
+        # Read a list of standard Slater-Koster files
         if isinstance(path, list):
-
-            compr_list, element_name_list = _split_name_r(path, is_vcr=True)
-            path_homo = kwargs['path_homo']
-            element_name_list_atom = _split_name_r(path_homo, is_vcr=False)
-
-            # unique element pair and their indices
-            element_set = set(element_name_list)
-            ind = [[i for i, ie in enumerate(element_name_list) if ie == ies]
-                   for ies in element_set]
-
-            # loop over all unique element pair
-            _skf = []
-            for ie, idx in zip(element_set, ind):
-
-                # loop over all compression radii
-                _iskf, _compr, kwargs_in = [], [], {}
-                for iid in idx:
-                    _iskf.append(super().read(path[iid], atom_pair,  **kwargs))
-                    _compr.append(compr_list[iid])
-
-                # merge data with various compression radii
-                atom_pair = _iskf[-1].atom_pair
-                nr = int(np.sqrt(len(idx)))  # -> Number of compression radii
-                h_data = {ikey: pack([isk.hamiltonian[ikey] for isk in _iskf])
-                          for ikey in _iskf[-1].hamiltonian.keys()}
-                s_data = {ikey: pack([isk.overlap[ikey] for isk in _iskf])
-                          for ikey in _iskf[-1].overlap.keys()}
-                grid = pack([isk.grid for isk in _iskf])
-
-                _cut = [isk.hs_cutoff for isk in _iskf]
-                assert max(_cut) == min(_cut), \
-                    'Please set all the cutoff as the same, get max value' + \
-                        f'{max(_cut)} and min value {min(_cut)}'
-                hs_cut = _cut[0]
-
-                # smooth the tail of HS in case the size is different
-                if smooth_to_zero:
-                    n_grid = torch.tensor([len(isk.grid) for isk in _iskf])
-                    h_data = {ikey: vcr_poly_to_zero(
-                        grid, h_data[ikey], n_grid) for ikey in h_data.keys()}
-                    s_data = {ikey: vcr_poly_to_zero(
-                        grid, s_data[ikey], n_grid) for ikey in s_data.keys()}
-                h_data = {ikey: h_data[ikey].reshape(nr, nr, h_data[ikey].shape[1], -1)
-                          for ikey in h_data.keys()}
-                s_data = {ikey: s_data[ikey].reshape(nr, nr, s_data[ikey].shape[1], -1)
-                          for ikey in s_data.keys()}
-
-                # update grid after smooth, the grid equals to max grid
-                step = _iskf[-1].grid[..., -1] - _iskf[-1].grid[..., -2]
-                grid = torch.arange(1, h_data[
-                    list(h_data.keys())[0]].shape[-1] + 2) * step
-
-                if _iskf[-1].r_poly is not None:
-                    kwargs_in['r_poly'] = pack([
-                        isk.r_poly for isk in _iskf]).reshape(nr, nr, -1)
-
-                # atomic data from path_homo
-                if ie[0] == ie[1]:
-                    ind = element_name_list_atom.index(ie)
-                    _homo = super().read(path_homo[ind], atom_pair, **kwargs)
-                    for ih in ['mass', 'occupations', 'on_sites', 'hubbard_us']:
-                        kwargs_in[ih] = getattr(_homo, ih)
-
-                if _iskf[-1].r_spline is not None:
-                    r_grid = pack([ii.r_spline.grid for ii in _iskf])
-                    r_cutoff = pack([ii.r_spline.cutoff.unsqueeze(0) for ii in _iskf])
-                    r_spline_coef = pack([ii.r_spline.spline_coef for ii in _iskf])
-                    r_exp_coef = pack([ii.r_spline.exp_coef for ii in _iskf])
-                    r_tail_coef = pack([ii.r_spline.tail_coef for ii in _iskf])
-
-                    kwargs_in['r_spline'] = cls.RSpline(
-                        # Repulsive grid, cutoff & repulsive spline coefficients.
-                        r_grid, r_cutoff, r_spline_coef,
-                        # The exponential and tail spline's coefficients.
-                        r_exp_coef, r_tail_coef)
-
-                _skf.append(cls(atom_pair, h_data, s_data, grid, hs_cut,
-                                **kwargs_in))
-
-            return _skf
-
-        else:
+            return cls._read_skf(
+                path, path_homo, atom_pair, smooth_to_zero, **kwargs)
+        else:  # -> binary h5 SK files
             return super().read(path, atom_pair, **kwargs)
 
     def to_hdf5(self, target: Group):
         """Saves the `Skf` instance into a target HDF5 Group."""
         super().to_hdf5(target)
 
-    def write(self, path: list, overwrite: Optional[bool] = False):
+    def write(self, path: str, overwrite: Optional[bool] = False):
         """Writes the `Skf` instance into a target HDF5 Group."""
         super().write(path, overwrite)
+
+    @classmethod
+    def _read_skf(cls, path: Union[List[str], str],
+                  path_homo: Union[List[str], str] = None,
+                  atom_pair: Sequence[int] = None,
+                  smooth_to_zero: bool = True, **kwargs):
+        """Read a list Slater-Koster files with various variables."""
+        # loop over all compression radii
+        # element_name_list_atom = _split_name_r(path_homo, is_tvcr=False)
+        _iskf, _compr, kwargs_in = [], [], {}
+
+        for ipath in path:
+            _iskf.append(super().read(ipath, atom_pair,  **kwargs))
+
+        # merge data with various compression radii
+        atom_pair = _iskf[-1].atom_pair
+        nr = int(np.sqrt(len(path)))  # -> Number of compression radii
+        h_data = {ikey: pack([isk.hamiltonian[ikey] for isk in _iskf])
+                  for ikey in _iskf[-1].hamiltonian.keys()}
+        s_data = {ikey: pack([isk.overlap[ikey] for isk in _iskf])
+                  for ikey in _iskf[-1].overlap.keys()}
+        grid = pack([isk.grid for isk in _iskf])
+
+        _cut = [isk.hs_cutoff for isk in _iskf]
+        assert max(_cut) == min(_cut), \
+            'Please set all the cutoff as the same, get max value' + \
+                f'{max(_cut)} and min value {min(_cut)}'
+        hs_cut = _cut[0]
+
+        # smooth the tail of HS in case the size is different
+        if smooth_to_zero:
+            n_grid = torch.tensor([len(isk.grid) for isk in _iskf])
+            h_data = {ikey: vcr_poly_to_zero(
+                grid, h_data[ikey], n_grid) for ikey in h_data.keys()}
+            s_data = {ikey: vcr_poly_to_zero(
+                grid, s_data[ikey], n_grid) for ikey in s_data.keys()}
+
+        # reshape and transpose the dim as: vcr1, vcr2, distances, n_orb_pairs
+        h_data = {ikey: h_data[ikey].reshape(
+            nr, nr, h_data[ikey].shape[1], -1).transpose(-1, -2)
+            for ikey in h_data.keys()}
+        s_data = {ikey: s_data[ikey].reshape(
+            nr, nr, s_data[ikey].shape[1], -1).transpose(-1, -2)
+            for ikey in s_data.keys()}
+
+        # update grid after smooth, the grid equals to max grid
+        step = _iskf[-1].grid[..., -1] - _iskf[-1].grid[..., -2]
+        grid = torch.arange(1, h_data[
+            list(h_data.keys())[0]].shape[-2] + 2) * step
+
+        if _iskf[-1].r_poly is not None:
+            kwargs_in['r_poly'] = pack([
+                isk.r_poly for isk in _iskf]).reshape(nr, nr, -1)
+
+        # atomic data from path_homo
+        if atom_pair[0] == atom_pair[1]:
+            # ind = element_name_list_atom.index(atom_pair)
+            _homo = super().read(path_homo, atom_pair, **kwargs)
+            for ih in ['mass', 'occupations', 'on_sites', 'hubbard_us']:
+                kwargs_in[ih] = getattr(_homo, ih)
+
+
+        if _iskf[-1].r_spline is not None:
+            r_grid = pack([ii.r_spline.grid for ii in _iskf])
+            r_cutoff = pack([ii.r_spline.cutoff.unsqueeze(0) for ii in _iskf])
+            r_spline_coef = pack([ii.r_spline.spline_coef for ii in _iskf])
+            r_exp_coef = pack([ii.r_spline.exp_coef for ii in _iskf])
+            r_tail_coef = pack([ii.r_spline.tail_coef for ii in _iskf])
+
+            kwargs_in['r_spline'] = cls.RSpline(
+                # Repulsive grid, cutoff & repulsive spline coefficients.
+                r_grid, r_cutoff, r_spline_coef,
+                # The exponential and tail spline's coefficients.
+                r_exp_coef, r_tail_coef)
+
+        return cls(atom_pair, h_data, s_data, grid, hs_cut, **kwargs_in)
 
 
 class TvcrSkf(Skf):
@@ -779,12 +779,10 @@ class TvcrSkf(Skf):
                          on_sites, occupations, mass)
 
     @classmethod
-    def read(cls, path: Union[List[str], str], path_homo: list = None,
+    def read(cls, path: Union[List[str], str],
              atom_pair: Sequence[int] = None,
-             smooth_to_zero: bool = True,
-             write: bool = False, output: str = './tmp.db',
-             overwrite: Optional[bool] = False,
-             **kwargs) -> List['Skf']:
+             path_homo: Union[List[str], str] = None,
+             smooth_to_zero: bool = True, **kwargs) -> List['Skf']:
         """Parse Slater-Koster data from skf files and their binary analogs.
 
         `path` includes Slater-Koster data with various compression radii,
@@ -815,94 +813,9 @@ class TvcrSkf(Skf):
                 specified file.
         """
         if isinstance(path, list):
-            assert path_homo is not None, '`path_homo` is needed to read' + \
-                'on-site data, but get None.'
-            compr_list, element_name_list = _split_name_r(path, is_tvcr=True)
-            element_name_list_atom = _split_name_r(path_homo, is_tvcr=False)
-
-            # unique element pair and their indices
-            element_set = set(element_name_list)
-            ind = [[i for i, ie in enumerate(element_name_list) if ie == ies]
-                   for ies in element_set]
-
-            # loop over all unique element pair
-            _skf = []
-            for ie, idx in zip(element_set, ind):
-
-                # loop over all compression radii
-                _iskf, _compr, kwargs_in = [], [], {}
-                for iid in idx:
-                    _iskf.append(super().read(path[iid], atom_pair, **kwargs))
-                    _compr.append(compr_list[iid])
-
-                # merge data with various compression radii
-                atom_pair = _iskf[-1].atom_pair
-                nr = int(len(idx) ** 0.25)  # -> Number of compression radii
-                h_data = {ikey: pack([isk.hamiltonian[ikey] for isk in _iskf])
-                          for ikey in _iskf[-1].hamiltonian.keys()}
-                s_data = {ikey: pack([isk.overlap[ikey] for isk in _iskf])
-                          for ikey in _iskf[-1].overlap.keys()}
-                grid = pack([isk.grid for isk in _iskf])
-
-                _cut = [isk.hs_cutoff for isk in _iskf]
-                assert max(_cut) == min(_cut), \
-                    'Please set all the cutoff as the same, get max value' + \
-                        f'{max(_cut)} and min value {min(_cut)}'
-                hs_cut = _cut[0]
-
-                # smooth the tail of HS in case the size is different
-                if smooth_to_zero:
-                    n_grid = torch.tensor([len(isk.grid) for isk in _iskf])
-                    h_data = {ikey: vcr_poly_to_zero(
-                        grid, h_data[ikey], n_grid) for ikey in h_data.keys()}
-                    s_data = {ikey: vcr_poly_to_zero(
-                        grid, s_data[ikey], n_grid) for ikey in s_data.keys()}
-                h_data = {ikey: h_data[ikey].reshape(
-                    nr, nr, nr, nr, h_data[ikey].shape[1], -1)
-                          for ikey in h_data.keys()}
-                s_data = {ikey: s_data[ikey].reshape(
-                    nr, nr, nr, nr, s_data[ikey].shape[1], -1)
-                          for ikey in s_data.keys()}
-
-                # update grid after smooth, the grid equals to max grid
-                step = _iskf[-1].grid[..., -1] - _iskf[-1].grid[..., -2]
-                grid = torch.arange(1, h_data[
-                    list(h_data.keys())[0]].shape[-1] + 2) * step
-
-                if _iskf[-1].r_poly is not None:
-                    kwargs_in['r_poly'] = pack([
-                        isk.r_poly for isk in _iskf]).reshape(nr, nr, nr, nr, -1)
-
-                # atomic data from path_homo
-                if ie[0] == ie[1]:
-                    ind = element_name_list_atom.index(ie)
-                    _homo = super().read(path_homo[ind], atom_pair, **kwargs)
-                    for ih in ['mass', 'occupations', 'on_sites', 'hubbard_us']:
-                        kwargs_in[ih] = getattr(_homo, ih)
-
-                if _iskf[-1].r_spline is not None:
-                    r_grid = pack([ii.r_spline.grid for ii in _iskf])
-                    r_cutoff = pack([ii.r_spline.cutoff.unsqueeze(0) for ii in _iskf])
-                    r_spline_coef = pack([ii.r_spline.spline_coef for ii in _iskf])
-                    r_exp_coef = pack([ii.r_spline.exp_coef for ii in _iskf])
-                    r_tail_coef = pack([ii.r_spline.tail_coef for ii in _iskf])
-
-                    kwargs_in['r_spline'] = cls.RSpline(
-                        # Repulsive grid, cutoff & repulsive spline coefficients.
-                        r_grid, r_cutoff, r_spline_coef,
-                        # The exponential and tail spline's coefficients.
-                        r_exp_coef, r_tail_coef)
-
-                this_cls = cls(atom_pair, h_data, s_data, grid, hs_cut, **kwargs_in)
-
-                if write:
-                    this_cls.write(output, overwrite)
-
-                _skf.append(this_cls)
-
-            return _skf
-
-        else:
+            return cls._read_skf(
+                path, path_homo, atom_pair, smooth_to_zero, **kwargs)
+        else:  # -> binary h5 SK files
             return super().read(path, atom_pair, **kwargs)
 
     def to_hdf5(self, target: Group):
@@ -912,6 +825,83 @@ class TvcrSkf(Skf):
     def write(self, path: list, overwrite: Optional[bool] = False):
         """Writes the `Skf` instance into a target HDF5 Group."""
         super().write(path, overwrite)
+
+    @classmethod
+    def _read_skf(cls, path: Union[List[str], str],
+                  path_homo: Union[List[str], str] = None,
+                  atom_pair: Sequence[int] = None,
+                  smooth_to_zero: bool = True, **kwargs):
+        assert path_homo is not None, '`path_homo` is needed to read' + \
+            'on-site data, but get None.'
+        _iskf, _compr, kwargs_in = [], [], {}
+
+        for ipath in path:
+            _iskf.append(super().read(ipath, atom_pair, **kwargs))
+
+        # merge data with various compression radii
+        atom_pair = _iskf[-1].atom_pair
+        nr = int(len(path) ** 0.25)  # -> Number of compression radii
+        h_data = {ikey: pack([isk.hamiltonian[ikey] for isk in _iskf])
+                  for ikey in _iskf[-1].hamiltonian.keys()}
+        s_data = {ikey: pack([isk.overlap[ikey] for isk in _iskf])
+                  for ikey in _iskf[-1].overlap.keys()}
+        grid = pack([isk.grid for isk in _iskf])
+
+        _cut = [isk.hs_cutoff for isk in _iskf]
+        assert max(_cut) == min(_cut), \
+            'Please set all the cutoff as the same, get max value' + \
+                f'{max(_cut)} and min value {min(_cut)}'
+        hs_cut = _cut[0]
+
+        # smooth the tail of HS in case the size is different
+        if smooth_to_zero:
+            n_grid = torch.tensor([len(isk.grid) for isk in _iskf])
+            h_data = {ikey: vcr_poly_to_zero(
+                grid, h_data[ikey], n_grid) for ikey in h_data.keys()}
+            s_data = {ikey: vcr_poly_to_zero(
+                grid, s_data[ikey], n_grid) for ikey in s_data.keys()}
+        h_data = {ikey: h_data[ikey].reshape(
+            nr, nr, nr, nr, h_data[ikey].shape[1], -1)
+            for ikey in h_data.keys()}
+        s_data = {ikey: s_data[ikey].reshape(
+            nr, nr, nr, nr, s_data[ikey].shape[1], -1)
+            for ikey in s_data.keys()}
+
+        # update grid after smooth, the grid equals to max grid
+        step = _iskf[-1].grid[..., -1] - _iskf[-1].grid[..., -2]
+        grid = torch.arange(1, h_data[
+            list(h_data.keys())[0]].shape[-1] + 1) * step
+
+        if _iskf[-1].r_poly is not None:
+            kwargs_in['r_poly'] = pack([
+                isk.r_poly for isk in _iskf]).reshape(nr, nr, nr, nr, -1)
+
+        # atomic data from path_homo
+        if atom_pair[0] == atom_pair[1]:
+            # ind = element_name_list_atom.index(ie)
+            _homo = super().read(path_homo, atom_pair, **kwargs)
+            for ih in ['mass', 'occupations', 'on_sites', 'hubbard_us']:
+                kwargs_in[ih] = getattr(_homo, ih)
+
+        if _iskf[-1].r_spline is not None:
+            r_grid = pack([ii.r_spline.grid for ii in _iskf])
+            r_cutoff = pack([ii.r_spline.cutoff.unsqueeze(0) for ii in _iskf])
+            r_spline_coef = pack([ii.r_spline.spline_coef for ii in _iskf])
+            r_exp_coef = pack([ii.r_spline.exp_coef for ii in _iskf])
+            r_tail_coef = pack([ii.r_spline.tail_coef for ii in _iskf])
+
+            kwargs_in['r_spline'] = cls.RSpline(
+                # Repulsive grid, cutoff & repulsive spline coefficients.
+                r_grid, r_cutoff, r_spline_coef,
+                # The exponential and tail spline's coefficients.
+                r_exp_coef, r_tail_coef)
+
+        this_cls = cls(atom_pair, h_data, s_data, grid, hs_cut, **kwargs_in)
+
+        # if write:
+        #     this_cls.write(output, overwrite)
+
+        return this_cls
 
 
 #########################

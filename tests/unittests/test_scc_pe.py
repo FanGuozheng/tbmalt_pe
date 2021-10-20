@@ -24,6 +24,16 @@ def test_ase_h2o_pe(device):
     assert torch.max(abs(dftb2.charge - torch.tensor([[
         6.591468709378842, 0.704265645310579, 0.704265645310579]]))) < 1E-4
 
+    path_to_skf = '../train/vcr.h5'
+    grids = torch.tensor([1., 1.5, 2., 2.5, 3., 3.5, 4., 4.5, 5., 6., 8., 10.])
+    multi_varible = torch.tensor([[3.0, 3.0, 3.0]])
+    dftb2 = Dftb2(params, geometry, shell_dict=shell_dict,
+                  path_to_skf=path_to_skf, skf_type='h5', basis_type='vcr',
+                  interpolation='BicubInterp',
+                  grids=grids, multi_varible=multi_varible)
+    assert torch.max(abs(dftb2.charge - torch.tensor([[
+        6.591468709378842, 0.704265645310579, 0.704265645310579]]))) < 1E-4
+
 
 def test_scc_ch4_pe(device):
     """Test SCC DFTB for ch4 with periodic boundary condition."""
@@ -57,7 +67,7 @@ def test_batch_pe(device):
         ))) < 1E-8, 'Tolerance check'
 
 
-test_batch_pe(torch.device('cpu'))
+test_ase_h2o_pe(torch.device('cpu'))
 
 def test_batch_pe_2():
     """Test scc batch calculation."""

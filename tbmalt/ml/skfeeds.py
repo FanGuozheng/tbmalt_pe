@@ -19,8 +19,9 @@ from scipy.interpolate import CubicSpline
 from torch import Tensor
 from tbmalt.common.batch import pack
 from tbmalt.structures.geometry import unique_atom_pairs
-from tbmalt.common.maths.interpolation import PolyInterpU, BicubInterp, Spline1d
-from tbmalt.io.skf import Skf, VcrSkf
+from tbmalt.common.maths.interpolation import (
+    PolyInterpU, BicubInterp, Spline1d, MultiVarInterp, BSpline)
+from tbmalt.io.skf import Skf, VcrSkf, TvcrSkf
 from tbmalt.structures.geometry import batch_chemical_symbols
 
 
@@ -483,7 +484,8 @@ class VcrFeed(_SkFeed):
                  vcr: Tensor,
                  skf_type: Literal['h5', 'skf'] = 'h5',
                  geometry: Optional[dict] = None,
-                 elements: Optional[list] = None,
+                 element_numbers: Optional[Tensor] = None,
+                 path_homo: str = None,
                  integral_type: Literal['H', 'S'] = 'H',
                  **kwargs) -> Tuple['SkFeed', 'SkFeed']:
         """Read all skf files like the normal way in DFTB+ and return SkFeed.
@@ -498,8 +500,9 @@ class VcrFeed(_SkFeed):
         Arguments:
             path: Path to SKF files or joint path to binary SKF file.
             geometry: `Geometry` object, which contains element species.
-            elements: All element specie names for reading SKF files.
-            shell_dict: : Dictionary of shell numbers associated with the
+            element_numbers: All unique element numbers names for reading
+                Slater-Koster files.
+            shell_dict: Dictionary of shell numbers associated with the
                 interaction.
             vcr:
             integral_type:
@@ -508,6 +511,8 @@ class VcrFeed(_SkFeed):
             interpolation: Interpolation method of integrals which are not
                 in the grid points.
             orbital_resolve: If each orbital is resolved for U.
+            write_binary: .
+            binary_name: .
 
         Returnpaths:
             sktable_dict: Dictionary contains SKF integral tables.
@@ -531,25 +536,24 @@ class VcrFeed(_SkFeed):
         if kwargs.get('orbital_resolve', False):
             raise NotImplementedError('Not implement orbital resolved U.')
 
-        # Bicubic interpolation will be implemented soon
+        # Check for the interpolation method
         if interpolation == 'CubicSpline':
             interpolator = CubicSpline
             assert device == torch.device('cpu'), 'device must be cpu if ' + \
-                ' interpolation is CubicSpline, but get %s' % device
-        elif interpolation == 'PolyInterpU':
-            interpolator = PolyInterpU
+                f' interpolation is CubicSpline, but get {device}'
         elif interpolation == 'BicubInterp':
             interpolator = BicubInterp
         else:
-            raise NotImplementedError('%s is not implemented.' % interpolation)
+            raise NotImplementedError(
+                f'{interpolation} is not supported for `VcrFeed`.')
 
         if (is_dir := os.path.isdir(path)):
             warn('"hdf" binary Slater-Koster files are suggested, TBMaLT'
                  ' will generate binary with smoothed integral tails.')
 
-        # unique atom pairs is from either elements or geometry
-        assert elements is not None or geometry is not None, 'both ' + \
-            'elements and geometry are None.'
+        # Check for element_numbers or geometry, which give unique atom pairs
+        assert element_numbers is not None or geometry is not None, \
+            'both element_numbers and geometry are None.'
 
         # create a blank dict for integrals
         hs_dict, onsite_hs_dict = {}, {}
@@ -557,75 +561,67 @@ class VcrFeed(_SkFeed):
         # get global unique element species pair with geometry object
         if geometry is not None:
             element_pair = unique_atom_pairs(geometry)
-        elif elements is not None:
-            element_pair = unique_atom_pairs(symbols=elements)
-        if skf_type == 'skf':
-            _element_name = [batch_chemical_symbols(ie) for ie in element_pair]
-            _path = [os.path.join(path, ien[0] + '-' + ien[1] + '.skf')
-                     for ie, ien in zip(element_pair, _element_name)]
+        elif element_numbers is not None:
+            element_pair = unique_atom_pairs(
+                unique_atomic_numbers=element_numbers)
 
-        # check path existence, type (dir or file) and suffix
-        if skf_type == 'skf':
-            _path_vcr = [os.path.join(
-                path, ien[0] + '-' + ien[1] + '_' + "{:05.2f}".format(ir)
-                + '_' + "{:05.2f}".format(jr) + '.skf')
-                for ie, ien in zip(element_pair, _element_name)
-                for ir in vcr for jr in vcr]
-        else:
-            _path_vcr = path
+        _element_name = [batch_chemical_symbols(ie) for ie in element_pair]
 
-        hs_dict, onsite_hs_dict = cls._read_vcr(
-            hs_dict, onsite_hs_dict, interpolator, vcr, element_pair,
-            _path_vcr, _path, skf_type, integral_type, shell_dict, device, **kwargs)
+        for en, ep in zip(_element_name, element_pair):
+            if skf_type == 'skf':
+                _path_vcr = [os.path.join(
+                    path, en[0] + '-' + en[1] + '.' + "{:05.2f}".format(ir) +
+                    '.' + "{:05.2f}".format(jr) + '.skf')
+                    for ir in vcr for jr in vcr]
+
+                # path for homo Slater-Koster files
+                if ep[0] == ep[1]:
+                    if path_homo is None:
+                        warn('`path_homo` is None, the code will not read' + \
+                             ' homo SKF values.')
+                    else:
+                        _path_homo = os.path.join(
+                            path_homo, en[0] + '-' + en[1] + '.skf')
+            else:
+                _path_vcr = path
+                _path_homo = path
+
+            hs_dict, onsite_hs_dict = cls._read(
+                hs_dict, onsite_hs_dict, interpolator, vcr, ep,
+                _path_vcr, _path_homo, skf_type, integral_type, shell_dict,
+                device, **kwargs)
 
         return cls(hs_dict, onsite_hs_dict, vcr, **kwargs)
 
     @classmethod
     def _read(cls, hs_dict: dict, onsite_hs_dict: dict,
-              interpolator, element_pair, _path, skf_type,
-              integral_type, shell_dict,
-              device, **kwargs):
-        """Read."""
-        for ielement, ipath in zip(element_pair, _path):
+              interpolator: object,
+              vcr: Tensor, element_pair: Tensor,
+              _path_vcr: str, _path_homo: str,
+              skf_type: str, integral_type: str, shell_dict: dict,
+              device: torch.device, **kwargs) -> List[dict]:
+        """Read Slater-Koster files with various variables."""
+        write_binary = kwargs.get('write_binary', False)
+        binary_name = kwargs.get('binary_name', './vcr.hdf')
 
-            atom_pair = ielement if skf_type == 'h5' else None
-            skf = Skf.read(ipath, atom_pair, device=device, **kwargs)
+        skf = VcrSkf.read(_path_vcr, element_pair, path_homo=_path_homo)
 
-            # generate H or S in SKF files dict
-            hs_dict = _get_hs_dict(
-                hs_dict, interpolator, skf, integral_type, **kwargs)
+        if write_binary:
+            skf.write(binary_name, overwrite=True)
 
-            if ielement[0] == ielement[1]:
-                onsite_hs_dict = _get_onsite_dict(
-                    onsite_hs_dict, skf, shell_dict, integral_type)
+        hs_dict = _get_hs_dict(
+            hs_dict, interpolator, skf, integral_type, vcr=vcr, **kwargs)
 
-        return hs_dict, onsite_hs_dict
-
-    @classmethod
-    def _read_vcr(cls, hs_dict: dict, onsite_hs_dict: dict,
-              interpolator, vcr, element_pair, _path_vcr, _path, skf_type,
-              integral_type, shell_dict,
-              device, **kwargs):
-        """Read."""
-        vcrskf = VcrSkf.read(_path_vcr, element_pair, path_homo=_path)
-        if isinstance(vcr, list):
-            vcr = torch.tensor(vcr)
-
-        for skf in vcrskf:
-
-            # generate H or S in SKF files dict
-            hs_dict = _get_hs_dict(
-                hs_dict, interpolator, skf, integral_type,
-                vcr=vcr, **kwargs)
-
-            if skf.atom_pair[0] == skf.atom_pair[1]:
-                onsite_hs_dict = _get_onsite_dict(
-                    onsite_hs_dict, skf, shell_dict, integral_type)
+        # Read homo values
+        if element_pair[0] == element_pair[1]:
+            onsite_hs_dict = _get_onsite_dict(
+                onsite_hs_dict, skf, shell_dict, integral_type)
 
         return hs_dict, onsite_hs_dict
 
     def off_site(self, atom_pair: Tensor, shell_pair: Tensor,
-                 distances: Tensor, g_compr: tuple, **kwargs) -> Tensor:
+                 distances: Tensor, variables: tuple = None,
+                 **kwargs) -> Tensor:
         """Get integrals for given geometrys.
 
         Arguments:
@@ -645,19 +641,256 @@ class VcrFeed(_SkFeed):
         if kwargs.get('orbital_resolve', False):
             raise NotImplementedError('Not implement orbital resolved U.')
 
-        splines = self.off_site_dict[(*atom_pair.tolist(), *shell_pair.tolist())]
+        interp = self.off_site_dict[(*atom_pair.tolist(), *shell_pair.tolist())]
 
         # call the interpolator
-        if g_compr[0] is None:
-            integral = splines(distances)
+        if variables is None:
+            integral = interp(distances)
         else:
-            integral = splines(g_compr[0], g_compr[0], distances)
+            integral = interp(variables, distances)
 
         if isinstance(integral[0], np.ndarray):
             integral = torch.from_numpy(integral)
 
         return integral
-        # return pack(list_integral).T
+
+    def on_site(self, atomic_numbers: Tensor, **kwargs) -> List[Tensor]:
+        """Returns the specified on-site terms.
+
+        In sktable dictionary, s, p, d and f orbitals of original on-site
+        from Slater-Koster files have been expanded one, three, five and
+        seven times in default. The expansion of on-site could be controlled
+        by `orbital_expand` when loading Slater-Koster integral tables. The
+        output on-site size relies on the defined `max_ls`.
+
+        Arguments:
+            atomic_numbers: Atomic numbers for which on-site terms should be
+                returned.
+        max_ls: A dictionary specifying the maximum permitted angular momentum
+            associated with a each atomic number. keys must be integers not
+            torch tensors.
+
+        Returns:
+            on_sites: Tuple of on-site term tensors, one for each atom in
+                `atomic_numbers`.
+
+        """
+        return [self.on_site_dict[(ian.tolist())] for ian in atomic_numbers]
+
+    def to_hdf5(self, target: Group):
+        """Saves standard instance into a target HDF5 Group.
+
+        Arguments:
+            target: The hdf5 group to which the system's data should be saved.
+
+        Notes:
+            This function does not create its own group as it expects that
+            `target` is the group into which data should be writen.
+
+        """
+        pass
+
+
+class TvcrFeed(_SkFeed):
+    """This is the standardard method to supply Slater-Koster integral feeds.
+
+    The standard suggests that the feeds are similar to the method in DFTB+.
+    The `from_dir` function can be used to read normal Slater-Koster files
+    and return Hamiltonian and overlap feeds separatedly in default.
+
+    Arguments:
+        off_site_dict: Collections of off-site data as off-site feeds of
+            Hamiltonian or overlap.
+        on_site_dict: Collections of on-site data as on-site feeds of
+            Hamiltonian or overlap.
+
+    Attributes:
+        off_site_dict: Collections of off-site data as off-site feeds of
+            Hamiltonian or overlap.
+        on_site_dict: Collections of on-site data as on-site feeds of
+            Hamiltonian or overlap.
+
+    """
+    def __init__(self, off_site_dict: dict, on_site_dict: dict,
+                 compression_radii_grid: Tensor, **kwargs):
+        self.off_site_dict = off_site_dict
+        self.on_site_dict = on_site_dict
+        self.compression_radii_grid = compression_radii_grid
+
+    @classmethod
+    def from_dir(cls, path: str,
+                 shell_dict: dict,
+                 vcr: Tensor,
+                 skf_type: Literal['h5', 'skf'] = 'h5',
+                 geometry: Optional[dict] = None,
+                 element_numbers: Optional[Tensor] = None,
+                 path_homo: str = None,
+                 integral_type: Literal['H', 'S'] = 'H',
+                 **kwargs) -> Tuple['SkFeed', 'SkFeed']:
+        """Read all skf files like the normal way in DFTB+ and return SkFeed.
+
+        The geometry and elements are optional, which give the information of
+        the element species in SKF files to be read. The `h_feed` and `s_feed`
+        control if return Hamiltonian or overlap feeds, if False, it will
+        return an empty Hamiltonian feed or overlap feed. Besides Hamiltonian,
+        overlap and on-site, all other parameters original from SKF files are
+        packed to `params_dict`.
+
+        Arguments:
+            path: Path to SKF files or joint path to binary SKF file.
+            geometry: `Geometry` object, which contains element species.
+            element_numbers: All unique element numbers names for reading
+                Slater-Koster files.
+            shell_dict: Dictionary of shell numbers associated with the
+                interaction.
+            vcr:
+            integral_type:
+
+        Keyword Args:
+            interpolation: Interpolation method of integrals which are not
+                in the grid points.
+            orbital_resolve: If each orbital is resolved for U.
+            write_binary: .
+            binary_name: .
+
+        Returnpaths:
+            sktable_dict: Dictionary contains SKF integral tables.
+
+        Notes:
+            The interactions will rely on the maximum of quantum ℓ in the
+            system. Current only support up to d orbital. If you define the
+            interactions as `int_d`, which means the maximum of ℓ is 2, the
+            code will read all the s, p, d related integral tables.
+
+        """
+        interpolation = kwargs.get('interpolation', 'PolyInterpU')
+
+        # The device will first read from geometry, if geometry is None
+        # then from kwargs dictionary, default is cpu
+        if geometry is not None:
+            device = geometry.positions.device
+        else:
+            device = kwargs.get('device', torch.device('cpu'))
+
+        if kwargs.get('orbital_resolve', False):
+            raise NotImplementedError('Not implement orbital resolved U.')
+
+        # Check for the interpolation method
+        if interpolation == 'MultiVarInterp':
+            interpolator = MultiVarInterp
+        elif interpolation == 'BSpline':
+            interpolator = BSpline
+        else:
+            raise NotImplementedError(
+                f'{interpolation} is not supported for `VcrFeed`.')
+
+        if (is_dir := os.path.isdir(path)):
+            warn('"hdf" binary Slater-Koster files are suggested, TBMaLT'
+                 ' will generate binary with smoothed integral tails.')
+
+        # Check for element_numbers or geometry, which give unique atom pairs
+        assert element_numbers is not None or geometry is not None, \
+            'both element_numbers and geometry are None.'
+
+        # create a blank dict for integrals
+        hs_dict, onsite_hs_dict = {}, {}
+
+        # get global unique element species pair with geometry object
+        if geometry is not None:
+            element_pair = unique_atom_pairs(geometry)
+        elif element_numbers is not None:
+            element_pair = unique_atom_pairs(
+                unique_atomic_numbers=element_numbers)
+
+        _element_name = [batch_chemical_symbols(ie) for ie in element_pair]
+
+        for en, ep in zip(_element_name, element_pair):
+            if skf_type == 'skf':
+                _path_tvcr = [os.path.join(
+                    path, en[0] + '-' + en[1] + '.' + "{:05.2f}".format(dr1) +
+                    '.' + "{:05.2f}".format(dr2) + '.' + "{:05.2f}".format(wr1)
+                    + '.' + "{:05.2f}".format(wr2) + '.skf')
+                    for dr1 in vcr for dr2 in vcr for wr1 in vcr for wr2 in vcr]
+
+                # path for homo Slater-Koster files
+                if ep[0] == ep[1]:
+                    if path_homo is None:
+                        warn('`path_homo` is None, the code will not read' + \
+                             ' homo SKF values.')
+                    else:
+                        _path_homo = os.path.join(
+                            path_homo, en[0] + '-' + en[1] + '.skf')
+            else:
+                _path_tvcr = path
+                _path_homo = path
+
+            hs_dict, onsite_hs_dict = cls._read(
+                hs_dict, onsite_hs_dict, interpolator, vcr, ep,
+                _path_tvcr, _path_homo, skf_type, integral_type, shell_dict,
+                device, **kwargs)
+
+        return cls(hs_dict, onsite_hs_dict, vcr, **kwargs)
+
+    @classmethod
+    def _read(cls, hs_dict: dict, onsite_hs_dict: dict,
+              interpolator: object,
+              tvcr: Tensor, element_pair: Tensor,
+              _path_tvcr: str, _path_homo: str,
+              skf_type: str, integral_type: str, shell_dict: dict,
+              device: torch.device, **kwargs) -> List[dict]:
+        """Read Slater-Koster files with various variables."""
+        write_binary = kwargs.get('write_binary', False)
+        binary_name = kwargs.get('binary_name', './tvcr.hdf')
+        skf = TvcrSkf.read(_path_tvcr, element_pair, path_homo=_path_homo)
+
+        if write_binary:
+            skf.write(binary_name, overwrite=True)
+
+        hs_dict = _get_hs_dict(
+            hs_dict, interpolator, skf, integral_type, tvcr=tvcr, **kwargs)
+
+        # Read homo values
+        if element_pair[0] == element_pair[1]:
+            onsite_hs_dict = _get_onsite_dict(
+                onsite_hs_dict, skf, shell_dict, integral_type)
+
+        return hs_dict, onsite_hs_dict
+
+    def off_site(self, atom_pair: Tensor, shell_pair: Tensor,
+                 distances: Tensor, variables: tuple = None,
+                 **kwargs) -> Tensor:
+        """Get integrals for given geometrys.
+
+        Arguments:
+            distances: distances of single & multi systems.
+            atom_pair: skf files type. Support normal skf, h5py binary skf.
+            l_pair: The quantum number ℓ pairs.
+            ski_type: Type of integral, H or S.
+
+        Keyword Args:
+            orbital_resolve: If each orbital is resolved for U.
+            abcd: abcd parameters in cubic spline method.
+
+        Returns:
+            integral: Getting integral in SKF tables with given atom pair, ℓ
+                number pair, distance, or compression radii pair.
+        """
+        if kwargs.get('orbital_resolve', False):
+            raise NotImplementedError('Not implement orbital resolved U.')
+
+        interp = self.off_site_dict[(*atom_pair.tolist(), *shell_pair.tolist())]
+
+        # call the interpolator
+        if variables is None:
+            integral = interp(distances)
+        else:
+            integral = interp(variables.T[0], variables.T[1],
+                              variables.T[2], variables.T[3], distances)
+
+        if isinstance(integral[0], np.ndarray):
+            integral = torch.from_numpy(integral)
+
+        return integral
 
     def on_site(self, atomic_numbers: Tensor, **kwargs) -> List[Tensor]:
         """Returns the specified on-site terms.
@@ -697,7 +930,7 @@ class VcrFeed(_SkFeed):
 
 
 def _get_hs_dict(hs_dict: dict, interpolator: object,
-                 skf: object, skf_type: str, vcr=None,
+                 skf: object, skf_type: str, vcr=None, tvcr=None,
                  **kwargs) -> Tuple[dict, dict]:
     """Get Hamiltonian or overlap tables for each orbital interaction.
 
@@ -718,7 +951,9 @@ def _get_hs_dict(hs_dict: dict, interpolator: object,
         getattr(skf, 'overlap')
 
     for ii, interaction in enumerate(hs_data.keys()):
-        if vcr is None:
+
+        # Standard interpolation
+        if vcr is None and tvcr is None:
             hs_dict[(*skf.atom_pair.tolist(), *interaction)] = interpolator(
                 skf.grid, hs_data[interaction].T)
 
@@ -728,9 +963,16 @@ def _get_hs_dict(hs_dict: dict, interpolator: object,
                     hs_dict[(*skf.atom_pair.tolist(),
                              *interaction)].abcd.requires_grad_(build_abcd))
 
-        else:
+        # with one extra varible for each element atom
+        elif vcr is not None:
             hs_dict[(*skf.atom_pair.tolist(), *interaction)] = interpolator(
-                vcr, vcr, skf.grid, hs_data[interaction])
+                vcr, hs_data[interaction], skf.grid)
+
+        # with two extra varibles for each element atom
+        elif tvcr is not None:
+            hs_dict[(*skf.atom_pair.tolist(), *interaction)] = interpolator(
+                hs_data[interaction].permute(-2, 0, 1, 2, 3, -1),
+                tvcr, tvcr, tvcr, tvcr, skf.grid)
 
     return hs_dict
 
@@ -774,7 +1016,7 @@ def _get_onsite_dict(onsite_hs_dict: dict, skf: object, shell_dict, integral_typ
         onsite_hs_dict[(skf.atom_pair[0].tolist())] = torch.cat([
             isk.repeat(ioi) for ioi, isk in zip(
                 orb_index, skf.on_sites[: max_l + 1])])
-    # onsite_hs_dict[(skf.atom_pair[0].tolist())] = skf.on_sites
+
     elif integral_type == 'S':
         onsite_hs_dict[(skf.atom_pair[0].tolist())] = torch.cat([
             torch.ones(ioi) for ioi in orb_index])

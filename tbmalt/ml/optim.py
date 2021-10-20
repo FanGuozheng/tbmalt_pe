@@ -1,23 +1,26 @@
 """Train code."""
+from typing import Literal
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from tbmalt import Geometry, SkfParamFeed
 from tbmalt.common.maths import hellinger
 from tbmalt.common.batch import pack
 from tbmalt.physics.dftb.dftb import Dftb2
-from tbmalt.ml.skfeeds import SkfFeed, VcrFeed
+from tbmalt.ml.skfeeds import SkfFeed, VcrFeed, TvcrFeed
 from tbmalt.structures.basis import Basis
 from tbmalt.physics.dftb.slaterkoster import hs_matrix
 from tbmalt.ml.feature import Dscribe
 from tbmalt.ml.scikitlearn import SciKitLearn
-# from linear.linear import LinearRegression
+from tbmalt.structures.periodic import Periodic
+
 Tensor = torch.Tensor
 
 
 class Optim:
     """Optimizer."""
 
-    def __init__(self, geometry: object, reference: dict, variables: list,
+    def __init__(self, geometry: Geometry, reference: dict, variables: list,
                  params: dict, tolerance: float = 1E-7, **kwargs):
         self.geometry = geometry
         self.batch_size = self.geometry._n_batch
@@ -96,7 +99,7 @@ class Optim:
 class OptHs(Optim):
     """Optimize integrals with spline interpolation."""
 
-    def __init__(self, geometry, reference, parameter, shell_dict, **kwargs):
+    def __init__(self, geometry: Geometry, reference, parameter, shell_dict, **kwargs):
         self.basis = Basis(geometry.atomic_numbers, shell_dict)
         self.shell_dict = shell_dict
         build_abcd_h = kwargs.get('build_abcd_h', True)
@@ -158,20 +161,33 @@ class OptHs(Optim):
         return dftb
 
 
-class OptCompressionR(Optim):
+class OptVcr(Optim):
     """Optimize compression radii."""
 
-    def __init__(self, geometry, reference, parameter,
-                 compr_grid, shell_dict, **kwargs):
+    def __init__(self, geometry: Geometry, reference, parameter,
+                 compr_grid: Tensor, shell_dict: dict,
+                 skf_type: Literal['h5', 'skf'] = 'h5', **kwargs):
         """Initialize parameters."""
         self.compr_grid = compr_grid
         self.global_r = kwargs.get('global_r', False)
+        self.unique_atomic_numbers = geometry.unique_atomic_numbers()
+
         if not self.global_r:
-            self.compr = torch.ones(geometry.atomic_numbers.shape) * 3.5
+            # self.compr = torch.ones(geometry.atomic_numbers.shape) * 3.5
+            # self.compr.requires_grad_(True)
+            self.compr = torch.zeros(*geometry.atomic_numbers.shape, 2)
+            init_dict = {1: torch.tensor([2.5, 3.0]),
+                         6: torch.tensor([7.0, 2.7]),
+                         7: torch.tensor([8.0, 2.2]),
+                         8: torch.tensor([8.0, 2.3])}
+            for ii, iu in enumerate(self.unique_atomic_numbers):
+                mask = geometry.atomic_numbers == iu
+                self.compr[mask] = init_dict[iu.tolist()]
+
             self.compr.requires_grad_(True)
         else:
-            self.unique_atomic_numbers = geometry.unique_atomic_numbers()
-            self.compr0 = torch.ones(len(self.unique_atomic_numbers)) * 3.5
+            self.compr0 = torch.tensor([3.0, 2.7, 2.2, 2.3])
+            # self.compr0 = torch.ones(len(self.unique_atomic_numbers)) * 3.5
             self.compr = torch.zeros(geometry.atomic_numbers.shape)
             self.compr0.requires_grad_(True)
 
@@ -180,15 +196,16 @@ class OptCompressionR(Optim):
 
         self.shell_dict = shell_dict
         self.basis = Basis(geometry.atomic_numbers, self.shell_dict)
-        self.h_feed, self.s_feed = VcrFeed.from_dir(
-            parameter['dftb']['path_to_skf'], compr_grid, self.shell_dict, geometry=geometry,
-            interpolation='BicubInterp', h_feed=self.h_compr_feed, s_feed=self.s_compr_feed)
-
-        if not self.h_compr_feed or not self.s_compr_feed:
-           self.h_feed2, self.s_feed2 = SkfFeed.from_dir(
-                parameter['dftb']['path_to_skf2'], shell_dict, geometry,
-                interpolation='PolyInterpU', h_feed=self.h_compr_feed==False,
-                s_feed=self.s_compr_feed==False)
+        if self.h_compr_feed:
+            self.h_feed = VcrFeed.from_dir(
+                parameter['dftb']['path_to_skf'], self.shell_dict, compr_grid,
+                skf_type='h5', geometry=geometry, integral_type='H',
+                interpolation='BicubInterp')
+        if self.s_compr_feed:
+            self.s_feed = VcrFeed.from_dir(
+                parameter['dftb']['path_to_skf'], self.shell_dict, compr_grid,
+                skf_type='h5', geometry=geometry, integral_type='S',
+                interpolation='BicubInterp')
 
         if not self.global_r:
             super().__init__(
@@ -196,6 +213,13 @@ class OptCompressionR(Optim):
         else:
             super().__init__(
                 geometry, reference, [self.compr0], parameter, **kwargs)
+
+        self.skparams = SkfParamFeed.from_dir(
+            parameter['dftb']['path_to_skf'], self.geometry, skf_type=skf_type)
+        if self.geometry.isperiodic:
+            self.periodic = Periodic(self.geometry, self.geometry.cell,
+                                     cutoff=self.skparams.cutoff)
+
 
     def __call__(self, plot: bool = True, save: bool = True, **kwargs):
         """Train compression radii with target properties."""
@@ -222,19 +246,24 @@ class OptCompressionR(Optim):
                 mask = self.geometry.atomic_numbers == iu
                 self.compr[mask] = self.compr0[ii]
 
+        hs_obj = self.periodic if self.geometry.isperiodic else self.geometry
         if self.h_compr_feed:
-            ham = hs_matrix(self.geometry, self.basis, self.h_feed, self.compr)
+            ham = hs_matrix(hs_obj, self.basis, self.h_feed,
+                            multi_varible=self.compr)
         else:
-            ham = hs_matrix(self.geometry, self.basis, self.h_feed2)
+            ham = hs_matrix(hs_obj, self.basis, self.h_feed2)
 
         if self.s_compr_feed:
-            over = hs_matrix(self.geometry, self.basis, self.s_feed, self.compr)
+            over = hs_matrix(hs_obj, self.basis, self.s_feed,
+                             multi_varible=self.compr)
         else:
-            over = hs_matrix(self.geometry, self.basis, self.s_feed2)
+            over = hs_matrix(hs_obj, self.basis, self.s_feed2)
 
         self.ham_list.append(ham.detach()), self.over_list.append(over.detach())
-        self.dftb = Dftb2(self.params, self.geometry, self.shell_dict, ham, over, from_skf=True)
-        self.dftb()
+        self.dftb = Dftb2(self.params, self.geometry, self.shell_dict,
+                          self.params['dftb']['path_to_skf'],
+                          H=ham, S=over, from_skf=True)
+        # self.dftb()
         super().__loss__(self.dftb)
         self._compr.append(self.compr.detach().clone())
         self.optimizer.zero_grad()
@@ -250,9 +279,14 @@ class OptCompressionR(Optim):
         the code makes sure the compression radii is in the defined range.
         """
         # detach remove initial graph and make sure compr_ml is leaf tensor
-        compr = self.compr.detach().clone()
-        min_mask = compr[compr != 0].lt(para['ml']['compression_radii_min'])
-        max_mask = compr[compr != 0].gt(para['ml']['compression_radii_max'])
+        if not self.global_r:
+            compr = self.compr.detach().clone()
+            min_mask = compr[compr != 0].lt(para['ml']['compression_radii_min'])
+            max_mask = compr[compr != 0].gt(para['ml']['compression_radii_max'])
+        else:
+            vcr = self.compr0.detach().clone()
+            min_mask = vcr[vcr != 0].lt(para['ml']['compression_radii_min'])
+            max_mask = vcr[vcr != 0].gt(para['ml']['compression_radii_max'])
         if True in min_mask:
             if not self.global_r:
                 with torch.no_grad():
@@ -294,3 +328,143 @@ class OptCompressionR(Optim):
         dftb2 = Dftb2(self.params, geometry_pred, self.shell_dict, ham2, over2, from_skf=True)
         dftb2()
         return dftb2
+
+
+class OptTvcr(Optim):
+    """Optimize compression radii."""
+
+    def __init__(self, geometry: Geometry, reference, parameter,
+                 tvcr: Tensor, shell_dict, **kwargs):
+        """Initialize parameters."""
+        self.tvcr = tvcr
+        interpolation = kwargs.get('interpolation', 'MultiVarInterp')
+        self.global_r = kwargs.get('global_r', False)
+        self.unique_atomic_numbers = geometry.unique_atomic_numbers()
+
+        if not self.global_r:
+            # self.compr = torch.ones(geometry.atomic_numbers.shape, 2) * 3.5
+            # self.compr.requires_grad_(True)
+
+            # self.compr = torch.zeros(*geometry.atomic_numbers.shape, 2)
+            # init_dict = {1: torch.tensor([2.5, 3.0]),
+            #              6: torch.tensor([7.0, 2.7]),
+            #              7: torch.tensor([8.0, 2.2]),
+            #              8: torch.tensor([8.0, 2.3])}
+            # for ii, iu in enumerate(self.unique_atomic_numbers):
+            #     mask = geometry.atomic_numbers == iu
+            #     self.compr[mask] = init_dict[iu.tolist()]
+
+            # self.compr.requires_grad_(True)
+
+            raise NotImplementedError('OptTvcr only support global varibales.')
+        else:
+            # self.compr0 = torch.ones(len(self.unique_atomic_numbers), 2) * 3.5
+            # self.compr = torch.zeros(*geometry.atomic_numbers.shape, 2)
+            # self.compr0.requires_grad_(True)
+
+            self.compr = torch.zeros(*geometry.atomic_numbers.shape, 2)
+            self.compr0 = torch.tensor(
+                [[2.5, 3.0], [7.0, 2.7], [8.0, 2.2], [8.0, 2.3]]).requires_grad_(True)
+
+        self.h_compr_feed = kwargs.get('h_compr_feed', True)
+        self.s_compr_feed = kwargs.get('s_compr_feed', True)
+
+        self.shell_dict = shell_dict
+        self.basis = Basis(geometry.atomic_numbers, self.shell_dict)
+        if self.h_compr_feed:
+            self.h_feed = TvcrFeed.from_dir(
+                parameter['dftb']['path_to_skf'], self.shell_dict, tvcr,
+                skf_type='h5', geometry=geometry, integral_type='H',
+                interpolation=interpolation)
+        if self.s_compr_feed:
+            self.s_feed = TvcrFeed.from_dir(
+                parameter['dftb']['path_to_skf'], self.shell_dict, tvcr,
+                skf_type='h5', geometry=geometry, integral_type='S',
+                interpolation=interpolation)
+
+        if not self.global_r:
+            super().__init__(
+                geometry, reference, [self.compr], parameter, **kwargs)
+        else:
+            super().__init__(
+                geometry, reference, [self.compr0], parameter, **kwargs)
+
+    def __call__(self, plot: bool = True, save: bool = True, **kwargs):
+        """Train compression radii with target properties."""
+        super().__call__()
+        self._compr = []
+        self.ham_list,self.over_list = [], []
+        for istep in range(self.steps):
+            self._update_train()
+            print('step: ', istep, 'loss: ', self.loss.detach())
+
+            break_tolerance = istep >= self.params['ml']['min_steps']
+            if self.reach_convergence and break_tolerance:
+                break
+
+        if plot:
+            super().__plot__(istep + 1, self.loss_list[1:],
+                             compression_radii=self._compr)
+
+        return self.dftb
+
+    def _update_train(self):
+        if self.global_r:
+            for ii, iu in enumerate(self.unique_atomic_numbers):
+                mask = self.geometry.atomic_numbers == iu
+                self.compr[mask] = self.compr0[ii]
+
+        if self.h_compr_feed:
+            ham = hs_matrix(self.geometry, self.basis, self.h_feed,
+                            multi_varible=self.compr)
+        else:
+            ham = hs_matrix(self.geometry, self.basis, self.h_feed2)
+
+        if self.s_compr_feed:
+            over = hs_matrix(self.geometry, self.basis, self.s_feed,
+                             multi_varible=self.compr)
+        else:
+            over = hs_matrix(self.geometry, self.basis, self.s_feed2)
+
+        self.ham_list.append(ham.detach()), self.over_list.append(over.detach())
+        self.dftb = Dftb2(self.params, self.geometry, self.shell_dict,
+                          self.params['dftb']['path_to_skf'],
+                          H=ham, S=over, from_skf=True)
+        # self.dftb()
+        super().__loss__(self.dftb)
+        self._compr.append(self.compr.detach().clone())
+        self.optimizer.zero_grad()
+        self.loss.backward(retain_graph=True)
+        self.optimizer.step()
+        self._check(self.params)
+
+    def _check(self, para):
+        """Check the machine learning variables each step.
+
+        When training compression radii, sometimes the compression radii will
+        be out of range of given grid points and go randomly, therefore here
+        the code makes sure the compression radii is in the defined range.
+        """
+        # detach remove initial graph and make sure compr_ml is leaf tensor
+        if not self.global_r:
+            compr = self.compr.detach().clone()
+            min_mask = compr[compr != 0].lt(para['ml']['compression_radii_min'])
+            max_mask = compr[compr != 0].gt(para['ml']['compression_radii_max'])
+        else:
+            vcr = self.compr0.detach().clone()
+            min_mask = vcr[vcr != 0].lt(para['ml']['compression_radii_min'])
+            max_mask = vcr[vcr != 0].gt(para['ml']['compression_radii_max'])
+        if True in min_mask:
+            if not self.global_r:
+                with torch.no_grad():
+                    self.compr.clamp_(min=para['ml']['compression_radii_min'])
+            else:
+                with torch.no_grad():
+                    self.compr0.clamp_(min=para['ml']['compression_radii_min'])
+        if True in max_mask:
+            if not self.global_r:
+                with torch.no_grad():
+                    self.compr.clamp_(max=para['ml']['compression_radii_max'])
+            else:
+                with torch.no_grad():
+                    self.compr0.clamp_(min=para['ml']['compression_radii_min'])

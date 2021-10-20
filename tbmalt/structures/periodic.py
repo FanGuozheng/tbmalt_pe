@@ -156,7 +156,6 @@ class Periodic:
             torch.linspace(iran[0, 2], iran[1, 2],
                            ile[2]).repeat(ile[0] * ile[1])])
                         for ile, iran in zip(leng, ranges.transpose(1, 0))], value=1e3)
-
         rcellvec = pack([torch.matmul(ilv.transpose(0, 1), icv.T.unsqueeze(-1)).squeeze(-1)
                          for ilv, icv in zip(self.latvec, cellvec)], value=1e3)
 
@@ -218,6 +217,14 @@ class Periodic:
     def distance_vectors(self) -> Tensor:
         """Distance vector matrix between atoms in the system."""
         return self.neighbour_vec
+
+    @property
+    def cellvec_neighbour(self):
+        _mask = self.neighbour.any(-1).any(-1)
+        _cellvec = self.cellvec.permute(0, -1, -2)
+        _neighbour_vec = pack([_cellvec[ibatch][_mask[ibatch]]
+                              for ibatch in range(self.cutoff.size(0))])
+        return _neighbour_vec.permute(0, -1, -2)
 
     def unique_atomic_numbers(self) -> Tensor:
         """Identifies and returns a tensor of unique atomic numbers.

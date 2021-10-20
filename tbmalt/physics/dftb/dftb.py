@@ -7,6 +7,7 @@ import torch
 from tbmalt import Basis, SkfParamFeed
 import tbmalt.common.maths as maths
 from tbmalt import SkfFeed, hs_matrix
+from tbmalt.ml.skfeeds import VcrFeed, TvcrFeed
 from tbmalt.physics.electrons import fermi
 from tbmalt.physics.properties import mulliken
 from tbmalt.common.maths.mixer import Simple, Anderson
@@ -54,23 +55,30 @@ class Dftb2:
 
     def __init__(self, parameter: object, geometry: object, shell_dict,
                  path_to_skf: str, skf_type: Literal['h5', 'skf'] = 'h5',
-                 basis: object = None, ham: Tensor=None,
-                 over: Tensor = None, **kwargs):
+                 basis: object = None,
+                 basis_type: Literal['normal', 'vcr', 'tvcr'] = 'normal',
+                 H: Tensor=None, S: Tensor = None, **kwargs):
         self.geometry = geometry
         self.params = parameter
 
         self.basis = Basis(geometry.atomic_numbers, shell_dict)
-        if ham is None:
-            h_feed = SkfFeed.from_dir(
-                path_to_skf, shell_dict, skf_type=skf_type,
-                geometry=geometry, interpolation='PolyInterpU', integral_type='H')
-        if over is None:
-            s_feed = SkfFeed.from_dir(
-                path_to_skf, shell_dict, skf_type=skf_type,
-                geometry=geometry, interpolation='PolyInterpU', integral_type='S')
+
+        # Optional basis sources
+        hsfeed = {'normal': SkfFeed, 'vcr': VcrFeed, 'tvcr': TvcrFeed}[basis_type]
+        _grids = kwargs.get('grids', None)
+        _interp = kwargs.get('interpolation', 'PolyInterpU')
+        if H is None:
+            h_feed = hsfeed.from_dir(
+                path_to_skf, shell_dict, vcr=_grids, skf_type=skf_type,
+                geometry=geometry, interpolation=_interp, integral_type='H')
+        if S is None:
+            s_feed = hsfeed.from_dir(
+                path_to_skf, shell_dict, vcr=_grids, skf_type=skf_type,
+                geometry=geometry, interpolation=_interp, integral_type='S')
         self.skparams = SkfParamFeed.from_dir(
             path_to_skf, geometry, skf_type=skf_type)
 
+        # Create periodic related routine
         if self.geometry.isperiodic:
             self.periodic = Periodic(self.geometry, self.geometry.cell,
                                       cutoff=self.skparams.cutoff)
@@ -79,8 +87,11 @@ class Dftb2:
         else:
             hs_obj = self.geometry
 
-        self.ham = hs_matrix(hs_obj, self.basis, h_feed) if ham is None else ham
-        self.over = hs_matrix(hs_obj, self.basis, s_feed) if over is None else over
+        multi_varible = kwargs.get('multi_varible', None)
+        self.ham = hs_matrix(hs_obj, self.basis, h_feed,
+                             multi_varible=multi_varible) if H is None else H
+        self.over = hs_matrix(hs_obj, self.basis, s_feed,
+                              multi_varible=multi_varible) if S is None else S
         self._init_scc(**kwargs)
 
         self._scc()
@@ -109,12 +120,6 @@ class Dftb2:
             self.mixer = Simple(self.charge, return_convergence=True)
 
         if self.geometry.isperiodic:
-            # self.periodic = Periodic(self.geometry, self.geometry.cell,
-            #                           cutoff=self.skparams.cutoff)
-            # self.coulomb = Coulomb(self.geometry, self.periodic, method='search')
-
-            # assert self.coulomb is not None
-            # assert self.isperiodic is not None
             self.distances = self.periodic.periodic_distances
             self.u = self._expand_u(self.skparams.U)
         else:

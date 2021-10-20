@@ -75,6 +75,10 @@ def hs_matrix(geometry: Geometry, basis: Basis, sk_feed: SkFeed,
                       device=geometry.positions.device)
     isperiodic = geometry.isperiodic
 
+    # The multi_varible offer multi-dimensional interpolation and gather of
+    # integrals, the default will be 1D interpolation only with distances
+    multi_varible = kwargs.get('multi_varible', None)
+
     # True of the hamiltonian is square (used for safety checks)
     mat_is_square = mat.shape[-1] == mat.shape[-2]
 
@@ -126,12 +130,15 @@ def hs_matrix(geometry: Geometry, basis: Basis, sk_feed: SkFeed,
             _g_v = vec_mat_a.permute(0, 2, 3, 4, 1)[[*index_mask_a]]
             g_vecs = _g_v.permute(2, 0, 1).reshape(-1, _g_v.shape[1])
 
+        # gather multi_varible
+        g_var = _gether_var(multi_varible, index_mask_a)
+
         # Get off-site integrals from the sk_feed, passing on any kwargs
         # provided by the user. If the SK-feed is environmentally dependent,
         # then it will need the indices of the atoms; as this data cannot be
         # provided by the user it must be explicitly added to the kwargs here.
         integrals = _gather_off_site(g_anum, shell_pairs, g_dist, sk_feed,
-                                     isperiodic, **kwargs,
+                                     isperiodic, g_var, **kwargs,
                                      atom_indices=index_mask_a)
 
         # Make a call to the relevant Slater-Koster function to get the sk-block
@@ -187,7 +194,8 @@ def hs_matrix(geometry: Geometry, basis: Basis, sk_feed: SkFeed,
         sk_data = sk_data.flatten()
 
         if isperiodic:
-            sk_data = sk_data.flatten().reshape(dist_mat_a.shape[-1], -1).sum(0)
+            sk_data = _reshape_sk(geometry, sk_data, dist_mat_a,
+                                  index_mask_a, **kwargs)
 
         # Create the full sized index mask and assign the results.
         a_mask = torch.nonzero((l_mat_f == l_pair).all(-1)).T
@@ -250,7 +258,8 @@ def _gather_on_site(geometry: Geometry, basis: Basis, sk_feed: SkFeed,
 
 def _gather_off_site(
         atom_pairs: Tensor, shell_pairs: Tensor, distances: Tensor,
-        sk_feed: SkFeed, isperiodic: bool, **kwargs) -> Tensor:
+        sk_feed: SkFeed, isperiodic: bool, g_var: Tensor = None,
+        **kwargs) -> Tensor:
 
     """Retrieves integrals from a target feed in a batch-wise manner.
 
@@ -297,11 +306,15 @@ def _gather_off_site(
     if distances.ndim > 2:
         raise ValueError('Argument "distances" must be a 1d or 2d torch.tensor.')
 
+    # Deal with periodic condtions
     if isperiodic:
         n_cell = distances.shape[0]
         atom_pairs = atom_pairs.repeat(n_cell, 1)
         shell_pairs = shell_pairs.repeat(n_cell, 1)
         distances = distances.flatten()
+        if g_var is not None:
+            g_var = g_var.repeat(distances.shape[0], 1)
+
     integrals = None
 
     # Sort lists so that separate calls are not needed for O-H and H-O
@@ -332,9 +345,10 @@ def _gather_off_site(
 
         # Retrieve the integrals & assign them to the "integrals" tensor. The
         # SkFeed class requires all arguments to be passed in as keywords.
+        var = None if g_var is None else g_var[mask]
         off_sites = sk_feed.off_site(
             atom_pair=as_pair[..., :-2], shell_pair=as_pair[..., -2:],
-            distances=distances[mask],
+            distances=distances[mask], variables=var,
             atom_indices=ai_select, **kwargs)
 
         # The result tensor's shape cannot be *safely* identified prior to the
@@ -354,9 +368,54 @@ def _gather_off_site(
                 raise type(e)(
                     f'{e!s}. This could be due to shells with mismatching '
                     'angular momenta being provided.')
+
     # Return the resulting integrals
     return integrals
 
+
+def _gether_var(multi_varible, index_mask_a):
+    if multi_varible is None:
+        return None
+    elif multi_varible.dim() == 2:
+        return torch.stack([multi_varible[index_mask_a[0], index_mask_a[1]],
+                            multi_varible[index_mask_a[0], index_mask_a[2]]]).T
+    elif multi_varible.dim() == 3:
+        # [param1+atom1; param1+atom2; param2+atom1; param2+atom2;]
+        return torch.stack([
+            multi_varible[..., 0][index_mask_a[0], index_mask_a[1]],
+            multi_varible[..., 0][index_mask_a[0], index_mask_a[2]],
+            multi_varible[..., 1][index_mask_a[0], index_mask_a[1]],
+            multi_varible[..., 1][index_mask_a[0], index_mask_a[2]]]).T
+
+
+def _reshape_sk(geometry, sk_data, dist_mat_a, mask, **kwargs):
+    """Reshape periodic Hamiltonian and overlap data."""
+    neigh_size = dist_mat_a.shape[-1]
+    phase = torch.exp((0. + 1j) * _select_kpoint(geometry, mask, kpoint=None)).real
+
+    # repeat if there are p, d orbitals, since the total integrals size is not
+    # equal to atom pairs size
+    phase = phase.repeat_interleave(int(sk_data.reshape(
+        neigh_size, -1).shape[1] / phase.shape[1]), 1)
+
+    # sum along cell vector dimension
+    return (phase.flatten() * sk_data).reshape(neigh_size, -1).sum(0)
+
+    # return sk_data.flatten().reshape(dist_mat_a.shape[-1], -1).sum(0)
+
+def _select_kpoint(periodic, mask, kpoint):
+    """Select kpoint for each interactions."""
+    if kpoint is None:
+        batch_size = periodic.periodic_distances.shape[0]
+        cell_vec = periodic.cellvec_neighbour
+        # kpoint = np.pi * torch.ones(batch_size, 1, 3)
+        kpoint = torch.zeros(batch_size, 1, 3)
+
+        # 1st dim of returned dot_product(kpoint, cellvec) is cellvec size
+        return torch.bmm(kpoint[mask[0]], cell_vec[mask[0]]).squeeze(1).T
+    else:
+        cell_vec = periodic.cellvec
+        return torch.bmm(kpoint.unsqueeze(1)[mask], cell_vec[mask]).squeeze(1).T
 
 def sub_block_rot(l_pair: Tensor, u_vec: Tensor,
                   integrals: Tensor) -> Tensor:

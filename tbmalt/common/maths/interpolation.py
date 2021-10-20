@@ -5,7 +5,7 @@ Created on Fri Oct 15 17:32:49 2021
 
 @author: gz_fan
 """
-
+from typing import List
 import bisect
 import torch
 import numpy as np
@@ -16,52 +16,58 @@ Tensor = torch.Tensor
 class MultiVarInterp:
     """"""
 
-    def __init__(self, x: Tensor, y: Tensor, n_dims: int = None):
+    def __init__(self, x: List[Tensor], y: Tensor, **kwargs):
         # test x is ascending
         # test different idm is the same
-        self.x, self.y = self._check(x, y, n_dims)
+        self.x, self.y = self._check(x, y, **kwargs)
 
-    def __call__(self, x_new):
+    def __call__(self, x_new, distances):
         """"""
         x_new = x_new.unsqueeze(1) if x_new.dim() == 1 else x_new
-        assert len(x_new) == self.n_dims, '`len(x_new)` and `n_dims` are not equal'
-        x_new[x_new.lt(torch.min(self.x))] = torch.min(self.x)
-        x_new[x_new.gt(torch.max(self.x))] = torch.max(self.x)
+        assert x_new.shape[1] + 1 == len(self.x), 'input dimension error'
 
-        ind_lef = torch.searchsorted(self.x, x_new)
-        mask_max = ind_lef.ge(self.x.shape[1] - 1)
+        _y = self.y
+
+        for ii, ix in enumerate(x_new.T):
+            _y  = self._1d_linear(ix, self.x[ii], _y, ii==0)
+
+        return self._1d_linear(distances, self.x[-1], _y, False)
+
+    def _1d_linear(self, points, grid, values, is_1st_dim):
+        ind_lef = torch.searchsorted(grid, points)
+        mask_max = ind_lef.ge(len(grid) - 1)
         ind_rig = ind_lef + 1
 
         # to make sure index donot exceed shape of the shape x
-        ind_lef[mask_max] = self.x.shape[1] - 1
-        ind_rig[mask_max] = self.x.shape[1] - 1
+        ind_lef[mask_max] = len(grid) - 1
+        ind_rig[mask_max] = len(grid) - 1
 
-        # to get the ratio of index between grids
-        _y = self.y
-        for idim in range(self.n_dims):
-            x_ind_lef = self.x[idim][ind_lef[idim]]
-            x_ind_rig = self.x[idim][ind_rig[idim]]
-            grid_len = x_ind_rig - x_ind_lef
-            ratio_lef = (x_new[idim] - x_ind_lef) / grid_len
-            ratio_rig = (x_ind_rig - x_new[idim]) / grid_len
-            _y = _y.transpose(idim, 0)
-            y_lef, y_rig = _y[ind_lef[idim]], _y[ind_rig[idim]]
+        # get the nearest grid point
+        x_ind_lef = grid[ind_lef]
+        x_ind_rig = grid[ind_rig]
+        grid_len = x_ind_rig - x_ind_lef
 
-            _y = y_lef * ratio_lef + y_rig * ratio_rig
-
-        return _y
-
-    def _check(self, x, y, n_dims):
-        assert isinstance(x, Tensor), 'input x should be torch.tensor' + \
-            f' but get {type(x)}'
-        assert isinstance(y, Tensor), 'input y should be torch.tensor' + \
-            f' but get {type(y)}'
-
-        self.n_dims = y.dim() if n_dims is None else n_dims
-        if x.dim() == 1:
-            x = x.repeat(self.n_dims, 1)
+        if is_1st_dim:
+            y_lef, y_rig = values[ind_lef], values[ind_rig]
         else:
-            assert len(x) == self.n_dims
+            mask0 = torch.arange(len(points))
+            y_lef, y_rig = values[mask0, ind_lef], values[mask0, ind_rig]
+
+        ratio_lef = (points - x_ind_lef) / grid_len
+        ratio_rig = (x_ind_rig - points) / grid_len
+
+        return (y_lef.T * ratio_lef + y_rig.T * ratio_rig).T
+
+    def _check(self, x, y, **kwargs):
+        assert isinstance(x, list), 'input x should be list'
+        for ix in x:
+            assert isinstance(ix, Tensor), \
+                f'grid point should be torch.Tensor, but get {type(x)}'
+        assert isinstance(y, Tensor), \
+            f'values y should be torch.Tensor, but get {type(y)}'
+
+        self._n_dim_values = y.dim()
+        self._n_dim_inter = len(x)
 
         return x, y
 
@@ -89,33 +95,42 @@ class BicubInterp:
 
     def __init__(self, xmesh: Tensor, zmesh: Tensor, hs_grid=None):
         """Get interpolation with two variables."""
-        if zmesh.dim() < 2:
-            raise ValueError('zmesh dim should >= 2')
-        if zmesh.dim() == 2:
+        assert zmesh.shape[0] == zmesh.shape[1], \
+            f'1D and 2D shape of zmesh are not same, get {zmesh.shape[:2]}'
+        if zmesh.dim() < 2 or zmesh.dim() > 4:
+            raise ValueError(f'zmesh should be 2, 3, or 4D, get {zmesh.dim()}')
+        elif zmesh.dim() == 2:
+            assert hs_grid is None, 'Can not interpolate 2D tensor for hs_grid'
             zmesh = zmesh.unsqueeze(0)  # -> single to batch
+        elif zmesh.dim() == 3:
+            if hs_grid is not None:
+                zmesh.unsqueeze(0)
 
         self.xmesh = xmesh
         self.zmesh = zmesh
         self.hs_grid = hs_grid
 
-    def __call__(self, xnew: Tensor, distance=None):
+    def __call__(self, xnew: Tensor, distances=None):
         """Calculate bicubic interpolation.
 
         Arguments:
-            xnew: the interpolation points of atom-pairs in molecule, it can be
-                single atom-pair or multi atom-pairs.
+            xnew: The points to be interpolated for the first dimension and
+                second dimension.
         """
-        assert xnew.dim() <= 2
-        self.xi = xnew if xnew.dim() == 2 else xnew.unsqueeze(0)  # -> to batch
-        self.atp = self.xi.shape[0]  # number of atom pairs
-        self.arange_atp = torch.arange(self.atp)
+        self.xi = xnew if xnew.dim() == 2 else xnew.unsqueeze(0)
+        self.batch = self.xi.shape[0]  # number of atom pairs
+        self.arange_batch = torch.arange(self.batch)
 
-        if distance is not None:  # with DFTB+ distance interpolation
-            assert self.hs_grid is not None  # -> grid mesh for distance
-            pdim = [2, 0, 1] if self.zmesh.dim() == 3 else [2, 3, 0, 1]
-            zmesh = self.zmesh.permute(pdim)
+        if self.hs_grid is not None:  # with DFTB+ distance interpolation
+            assert distances is not None, 'if hs_grid is not None, '+ \
+                'distances is expected'
+
+            # original dims: vcr1, vcr2, distances, n_orb_pairs
+            # permute dims: distances, vcr1, vcr2, n_orb_pairs
+            zmesh = self.zmesh.permute([2, 0, 1, 3])
+
             ski = PolyInterpU(self.hs_grid, zmesh)
-            zmesh = ski(distance)
+            zmesh = ski(distances)
         else:
             zmesh = self.zmesh
 
@@ -147,14 +162,14 @@ class BicubInterp:
         a_mat = torch.matmul(torch.matmul(coeff, fmat.permute(pdim)), coeff_)
 
         return torch.stack([torch.matmul(torch.matmul(
-            xmat[:, i, 0], a_mat[i]), xmat[:, i, 1]) for i in range(self.atp)])
+            xmat[:, i, 0], a_mat[i]), xmat[:, i, 1]) for i in range(self.batch)])
 
     def _get_indices(self):
         """Get indices and repeat indices."""
         self.nx0 = torch.searchsorted(self.xmesh, self.xi.detach()) - 1
 
         # get all surrounding 4 grid points indices and repeat indices
-        self.nind = torch.tensor([ii for ii in range(self.atp)])
+        self.nind = torch.tensor([ii for ii in range(self.batch)])
         self.nx1 = torch.clamp(torch.stack([ii + 1 for ii in self.nx0]), 0,
                                len(self.xmesh) - 1)
         self.nx_1 = torch.clamp(torch.stack([ii - 1 for ii in self.nx0]), 0)
@@ -163,36 +178,288 @@ class BicubInterp:
 
     def _fmat0th(self, zmesh: Tensor):
         """Construct f(0/1, 0/1) in fmat."""
-        f00 = zmesh[self.arange_atp, self.nx0[..., 0], self.nx0[..., 1]]
-        f10 = zmesh[self.arange_atp, self.nx1[..., 0], self.nx0[..., 1]]
-        f01 = zmesh[self.arange_atp, self.nx0[..., 0], self.nx1[..., 1]]
-        f11 = zmesh[self.arange_atp, self.nx1[..., 0], self.nx1[..., 1]]
+        f00 = zmesh[self.arange_batch, self.nx0[..., 0], self.nx0[..., 1]]
+        f10 = zmesh[self.arange_batch, self.nx1[..., 0], self.nx0[..., 1]]
+        f01 = zmesh[self.arange_batch, self.nx0[..., 0], self.nx1[..., 1]]
+        f11 = zmesh[self.arange_batch, self.nx1[..., 0], self.nx1[..., 1]]
         return f00, f10, f01, f11
 
     def _fmat1th(self, zmesh: Tensor, f00: Tensor, f10: Tensor, f01: Tensor,
                  f11: Tensor):
         """Get the 1st derivative of four grid points over x, y and xy."""
-        f_10 = zmesh[self.arange_atp, self.nx_1[..., 0], self.nx0[..., 1]]
-        f_11 = zmesh[self.arange_atp, self.nx_1[..., 0], self.nx1[..., 1]]
-        f0_1 = zmesh[self.arange_atp, self.nx0[..., 0], self.nx_1[..., 1]]
-        f02 = zmesh[self.arange_atp, self.nx0[..., 0], self.nx2[..., 1]]
-        f1_1 = zmesh[self.arange_atp, self.nx1[..., 0], self.nx_1[..., 1]]
-        f12 = zmesh[self.arange_atp, self.nx1[..., 0], self.nx2[..., 1]]
-        f20 = zmesh[self.arange_atp, self.nx2[..., 0], self.nx0[..., 1]]
-        f21 = zmesh[self.arange_atp, self.nx2[..., 0], self.nx1[..., 1]]
+        f_10 = zmesh[self.arange_batch, self.nx_1[..., 0], self.nx0[..., 1]]
+        f_11 = zmesh[self.arange_batch, self.nx_1[..., 0], self.nx1[..., 1]]
+        f0_1 = zmesh[self.arange_batch, self.nx0[..., 0], self.nx_1[..., 1]]
+        f02 = zmesh[self.arange_batch, self.nx0[..., 0], self.nx2[..., 1]]
+        f1_1 = zmesh[self.arange_batch, self.nx1[..., 0], self.nx_1[..., 1]]
+        f12 = zmesh[self.arange_batch, self.nx1[..., 0], self.nx2[..., 1]]
+        f20 = zmesh[self.arange_batch, self.nx2[..., 0], self.nx0[..., 1]]
+        f21 = zmesh[self.arange_batch, self.nx2[..., 0], self.nx1[..., 1]]
 
         # calculate the derivative: (F(1) - F(-1) / (2 * grid)
-        fy00 = (f01 - f0_1) / (self.nx1[..., 1] - self.nx_1[..., 1])
-        fy01 = (f02 - f00) / (self.nx2[..., 1] - self.nx0[..., 1])
-        fy10 = (f11 - f1_1) / (self.nx1[..., 1] - self.nx_1[..., 1])
-        fy11 = (f12 - f10) / (self.nx2[..., 1] - self.nx0[..., 1])
-        fx00 = (f10 - f_10) / (self.nx1[..., 0] - self.nx_1[..., 0])
-        fx01 = (f20 - f00) / (self.nx2[..., 0] - self.nx0[..., 0])
-        fx10 = (f11 - f_11) / (self.nx1[..., 0] - self.nx_1[..., 0])
-        fx11 = (f21 - f01) / (self.nx2[..., 0] - self.nx0[..., 0])
+        fy00 = ((f01 - f0_1).T / (self.nx1[..., 1] - self.nx_1[..., 1])).T
+        fy01 = ((f02 - f00).T / (self.nx2[..., 1] - self.nx0[..., 1])).T
+        fy10 = ((f11 - f1_1).T / (self.nx1[..., 1] - self.nx_1[..., 1])).T
+        fy11 = ((f12 - f10).T / (self.nx2[..., 1] - self.nx0[..., 1])).T
+        fx00 = ((f10 - f_10).T / (self.nx1[..., 0] - self.nx_1[..., 0])).T
+        fx01 = ((f20 - f00).T / (self.nx2[..., 0] - self.nx0[..., 0])).T
+        fx10 = ((f11 - f_11).T / (self.nx1[..., 0] - self.nx_1[..., 0])).T
+        fx11 = ((f21 - f01).T / (self.nx2[..., 0] - self.nx0[..., 0])).T
         fxy00, fxy11 = fy00 * fx00, fx11 * fy11
         fxy01, fxy10 = fx01 * fy01, fx10 * fy10
+
         return fy00, fy01, fy10, fy11, fx00, fx01, fx10, fx11, fxy00, fxy01, fxy10, fxy11
+
+
+class BSpline:
+    """Providing routines for multivariate interpolation with tensor product
+    splines.
+
+    The number of nodes has to be at least 4 in every dimension. Otherwise a
+    singularity error will occur during  calculation.
+
+    Arguments:
+        f_nodes (Tensor): Values at the given sites.
+        x_nodes (Tensor): x-nodes of the interpolation data.
+        *args (Tensor): y-, z-, ... nodes. Every set of nodes is a
+            tensor.
+
+    Notes:
+        The theory of the univariate b-splines were taken from [3]_. The
+        mathematical background about the calculations of the coefficients
+        during a multivariate interpolation were taken from [4]_.
+
+    References:
+        .. [3] Boor, C.d. 2001, "A Practical Guide to Splines". Rev. ed.
+           Springer-Verlag
+        .. [4] Floater, M.S. (2007) "Tensor Product Spline Surfaces"[Online].
+           Available at: https://www.uio.no/studier/emner/matnat/ifi/nedlagte-emner/INF-MAT5340/v07/undervisningsmateriale/kap7.pdf
+           (Accessed: 01 December 2020)
+    """
+
+    def __init__(self, f_nodes: torch.Tensor, x_nodes: torch.Tensor,
+                 *args: torch.Tensor):
+        # Dimensions will be called the following: x, y, z, a, b, c, d, ...
+        # f_nodes has shape (x, y, z, a, b, ...)
+        self.f_nodes = f_nodes
+
+        self.nodes = [x_nodes, *args]
+        self.device = self.f_nodes.device
+
+        self.num = len(self.nodes)
+
+        # Permute f_nodes: (z, a, b, ... , x, y)
+        if self.f_nodes.dim() == len(self.nodes) + 1:
+            self.f_nodes = [_if.permute(tuple(torch.arange(self.num).roll(-2)))
+                            for _if in f_nodes]
+        elif self.f_nodes.dim() == len(self.nodes):
+            self.f_nodes = [f_nodes.permute(
+                tuple(torch.arange(self.num).roll(-2)))]
+        else:
+            raise ValueError('do not support f_nodes dims')
+
+        # Calculate a list containing the knot-vectors of every dimension
+        self.knot_vec = [self.get_knot_vector(nodes) for nodes in self.nodes]
+
+        # Calculate a list containing tensors of b-splines for every
+        # dimension.
+        self.bsplines = [self.get_bsplines(self.knot_vec[ii], self.nodes[ii],
+                                           self.nodes[ii], 4)
+                         for ii in range(self.num)]
+
+        # Create cyclic permutation for the coefficients.
+        roll_permutation = torch.arange(self.num).roll(-1)
+
+        _dd, d_list = self.f_nodes, []
+        for idd in _dd:
+            for ii in self.bsplines:
+                idd = torch.solve(idd, ii.T).solution.permute(*roll_permutation)
+            d_list.append(idd)
+
+        # c has now the following shape: (z, a, b, ... , x, y)
+        self.cc = d_list
+
+    def get_knot_vector(self, nodes: torch.Tensor) -> torch.Tensor:
+        """Calculates the corresponding knot vector for the given nodes.
+
+        Arguments:
+            nodes (Tensor): Nodes of which the knot vector should be
+                calculated.
+
+        Returns:
+            tt (Tensor): Knot vector for the given nodes.
+        """
+
+        tt = torch.zeros((len(nodes) + 4,), device=self.device)
+        tt[0:4] = nodes[0]
+        tt[4:-4] = nodes[2:-2]
+        tt[-4:] = nodes[-1]
+
+        return tt
+
+    def get_bsplines(self, tt: torch.Tensor, xx: torch.Tensor,
+                     nodes: torch.Tensor, kk: int) -> torch.Tensor:
+        r"""Calculates a tensor containing the values of the b-splines at the
+        given sites.
+
+        Assume that: :math:`\text{len}(x) = m, \text{len}(x_{\text{nodes}}) =
+        n`. The tensor has dimensions: :math:`(m, n)`. The b-splines are
+        row-vectors. Hence the tensor has the following structure:
+
+        .. math::
+
+           \begin{matrix}
+           B_1(x_1) & ... & B_1(x_m)\\
+           \vdots &  & \vdots\\
+           B_n(x_1) & ... & B_n(x_m)
+           \end{matrix}
+
+        Arguments:
+            tt (Tensor): Knot vector of the corresponding nodes.
+            xx (Tensor): Values where the b-splines should be evaluated.
+            nodes (Tensor): Interpolation nodes.
+            kk (int): Order of the b-splines. Order of `k` means that the
+                b-splines have degree `k`-1.
+
+        Returns:
+            b_tensor (Tensor): Tensor containing the values of the
+                b-splines at the corresponding x-values.
+        """
+
+        j_num = torch.arange(0, len(tt) - kk, device=self.device)
+
+        # Calculate a tensor containing the b-splines for every dimension
+        b_tensor = [self._b_spline(tt, xx, nodes, jj, kk) for jj
+                    in j_num]
+
+        b_tensor = torch.stack(b_tensor)
+
+        return b_tensor
+
+    def _b_spline(self, tt: torch.Tensor, xx: torch.Tensor,
+                  nodes: torch.Tensor, jj: int, kk: int) -> torch.Tensor:
+        r"""Calculates the b-spline for a given knot vector.
+
+        It calculates the y-values of the `j`th b-spline of order `k`.
+        The b-spline will be calculated for the knot vector `t`. The
+        calculation follows the recurrence relation:
+
+        .. math::
+
+           B_{j, 1} = 1 if t_j \leq x < t_{jj + 1}, 0 \text{otherwise}
+           B_{j, k} = \frac{x - t_j}{t_{j + k - 1} - t_j} B_{j, k-1}
+           + (1 - \frac{x - t_{j + 1}}{t_{j + k} -
+           t_{j + 1}} B_{j + 1, k-1}
+
+        Arguments:
+            tt (Tensor): Knot vector. Tensor containing the knots. You
+                need at least `k`+1 knots.
+            xx (Tensor): Tensor containing the x-values where the
+                b-spline should be evaluated.
+            jj (int): Specifies which b-spline should be calculated.
+            kk (int): Specifies the order of the b-spline. Order of `k` means
+                that the calculated polynomial has degree `k-1`.
+
+        Returns:
+            yy (Tensor): Tensor containing the y-values of the `j`th
+                b-spline of order `k` for the corresponding x-values.
+        """
+
+        t1 = tt[jj]
+        t2 = tt[jj + 1]
+        t3 = tt[jj + kk - 1]
+        t4 = tt[jj + kk]
+
+        if kk == 1:
+            yy = torch.where((tt[jj] <= xx) & (xx < tt[jj + 1]), 1, 0)
+            if jj == len(tt) - 4:
+                yy = torch.where((tt[jj] <= xx) & (xx <= tt[jj + 1]), 1, 0)
+            if len(nodes) == 2 and jj == 1:
+                yy = torch.where((tt[jj] <= xx) & (xx <= tt[jj + 1]), 1, 0)
+        else:
+            # Here the recursion formula will be executed. The 'if' and 'else'
+            # blocks ensure that one avoid the division by zero.
+            if tt[jj + kk - 1] == tt[jj] and tt[jj + kk] == tt[jj + 1]:
+                yy = self._b_spline(tt, xx, nodes, jj + 1, kk - 1)
+            elif tt[jj + kk - 1] == tt[jj] and tt[jj + kk] != tt[jj + 1]:
+                yy = (1 - (xx - t2) / (t4 - t2)) * \
+                     self._b_spline(tt, xx, nodes, jj + 1, kk - 1)
+            elif tt[jj + kk - 1] != tt[jj] and tt[jj + kk] == tt[jj + 1]:
+                yy = (xx - t1) / (t3 - t1) * \
+                     self._b_spline(tt, xx, nodes, jj, kk - 1) \
+                     + self._b_spline(tt, xx, nodes, jj + 1, kk - 1)
+            else:
+                yy = (xx - t1) / (t3 - t1) * \
+                     self._b_spline(tt, xx, nodes, jj, kk - 1) \
+                     + (1 - (xx - t2) / (t4 - t2)) * \
+                     self._b_spline(tt, xx, nodes, jj + 1, kk - 1)
+        return yy
+
+    def __call__(self, x_new: torch.Tensor, *args: torch.Tensor, grid=True)\
+            -> torch.Tensor:
+        """Evaluates the spline function at the desired sites.
+
+        Arguments:
+            x_new (Tensor): x-values, where you want to evaluate the spline
+                function.
+            *args (Tensor): New values for the other dimensions.
+            grid (bool): You can decide whether you want to evaluate the
+                results on a grid or not. If `grid=True` (default) the grid is
+                spanned by the input tensors. If `grid=False` the spline
+                function will be evaluated at single points specified by the
+                rows of one single input tensor with dimension of 2 or by the
+                values of multiple tensors.
+
+        Returns:
+            ff (Tensor): Tensor containing the values at the given sites.
+        """
+
+        if len(x_new.size()) == 1:
+            new_vals = [x_new, *args]
+        else:
+            new_vals = [x_new[:, ii] for ii in range(x_new.shape[1])]
+        inverted_num = torch.arange(0, self.num).flip(0)
+
+        # matrices contains the b-spline tensors but in inverted order.
+        matrices = [self.get_bsplines(self.knot_vec[ii], new_vals[ii],
+                                      self.nodes[ii], 4).T
+                    for ii in inverted_num]
+
+        # permutation1: cyclic permutation.
+        # Permute dd so it has shape: (y, z, a, b, ..., x)
+        # dd = self.cc.permute(*torch.arange(self.num).roll(1))
+        _dd = [ic.permute(*torch.arange(self.num).roll(1)) for ic in self.cc]
+        _d_list = []
+
+        for dd in _dd:
+            permutation = [-2, *range(self.num - 2), -1]
+            for ii in range(self.num):
+                if ii == self.num - 1:
+                    # For the last multiplication permute dd so the shapes
+                    # matches properly
+                    dd = dd.transpose(-1, -2)
+
+                dd = torch.matmul(matrices[ii], dd)
+                dd = dd.permute(permutation)
+
+                # to get the diagonal values, instead of [n_batch, n_batch ...]
+                if ii > 0:
+                    permutation = [-2, *range(self.num - 2 - ii), -1]
+                    _mask = torch.arange(dd.shape[0])
+                    dd = dd[_mask, _mask]
+
+            _d_list.append(dd)
+
+        # Final permutation of f so it has the same shape as f_nodes in the
+        # input: (x, y, z, a, b, ...).
+        ff = _d_list  # dd
+
+        for _if in ff:
+            if not grid:
+                for ii in range(self.num - 1):
+                    _if = torch.diagonal(_if)
+
+        return torch.stack(ff).T
 
 
 class Spline1d:
@@ -356,31 +623,31 @@ class PolyInterpU:
         # Beyond the grid => extrapolation with polynomial of 5th order
         max_ind = self.ngridpoint - 1 + int(tail / self.incr)
         is_tail = ind.masked_fill(ind.ge(self.ngridpoint) * ind.le(max_ind), -1).eq(-1)
-        if is_tail.any():
-            dr = rr[is_tail] - rmax
+        # if is_tail.any():
+        #     dr = rr[is_tail] - rmax
 
-            # For input integrals, it will be 2D, such as (nsize) * (pp0, pp1),
-            # initial dr is 1D and will result in errors
-            dr = dr.repeat(self.yy.shape[1], 1).T if self.yy.dim() == 2 else dr
-            ilast = self.ngridpoint
+        #     # For input integrals, it will be 2D, such as (nsize) * (pp0, pp1),
+        #     # initial dr is 1D and will result in errors
+        #     dr = dr.repeat(self.yy.shape[1], 1).T if self.yy.dim() == 2 else dr
+        #     ilast = self.ngridpoint
 
-            # get grid points and grid point values
-            xa = (ilast - ninterp + torch.arange(ninterp)) * self.incr
-            yb = self.yy[ilast - ninterp - 1: ilast - 1]
-            xa = xa.repeat(dr.shape[0]).reshape(dr.shape[0], -1)
-            yb = yb.unsqueeze(0).repeat_interleave(dr.shape[0], dim=0)
+        #     # get grid points and grid point values
+        #     xa = (ilast - ninterp + torch.arange(ninterp)) * self.incr
+        #     yb = self.yy[ilast - ninterp - 1: ilast - 1]
+        #     xa = xa.repeat(dr.shape[0]).reshape(dr.shape[0], -1)
+        #     yb = yb.unsqueeze(0).repeat_interleave(dr.shape[0], dim=0)
 
-            # get derivative
-            y0 = poly_interp_2d(xa, yb, xa[:, ninterp - 1] - delta_r)
-            y2 = poly_interp_2d(xa, yb, xa[:, ninterp - 1] + delta_r)
-            y1 = self.yy[ilast - 2]
-            y1p = (y2 - y0) / (2.0 * delta_r)
-            y1pp = (y2 + y0 - 2.0 * y1) / (delta_r * delta_r)
+        #     # get derivative
+        #     y0 = poly_interp_2d(xa, yb, xa[:, ninterp - 1] - delta_r)
+        #     y2 = poly_interp_2d(xa, yb, xa[:, ninterp - 1] + delta_r)
+        #     y1 = self.yy[ilast - 2]
+        #     y1p = (y2 - y0) / (2.0 * delta_r)
+        #     y1pp = (y2 + y0 - 2.0 * y1) / (delta_r * delta_r)
 
-            if y1pp.dim() == 3:  # -> compression radii, not good
-                dr = dr.repeat(y1pp.shape[1], y1pp.shape[2], 1).transpose(-1, 0)
+        #     if y1pp.dim() == 3:  # -> compression radii, not good
+        #         dr = dr.repeat(y1pp.shape[1], y1pp.shape[2], 1).transpose(-1, 0)
 
-            result[is_tail] = poly5_zero(y1, y1p, y1pp, dr, -1.0 * tail)
+        #     result[is_tail] = poly5_zero(y1, y1p, y1pp, dr, -1.0 * tail)
 
         return result
 
@@ -551,8 +818,8 @@ def vcr_poly_to_zero(xx: Tensor, yy: Tensor, n_grid: Tensor, ninterp=8,
     y1 = _yy[torch.arange(_yy.shape[0]), ilast - 2]
     y1p = (y2 - y0) / (2.0 * delta_r)
     y1pp = (y2 + y0 - 2.0 * y1) / (delta_r * delta_r)
-    integral_tail = poly_to_zero(
-        dr, -1.0 * tail, -1.0 / tail, y1.unsqueeze(-1), y1p.unsqueeze(-1), y1pp.unsqueeze(-1)).permute(0, 2, 1)
+    integral_tail = poly5_zero(
+        y1.unsqueeze(-1), y1p.unsqueeze(-1), y1pp.unsqueeze(-1), dr, -1.0 * tail).permute(0, 2, 1)
 
     if _yy.shape[1] == max(n_grid):
         ynew = torch.zeros(ny1, ny3 + integral_tail.shape[1], ny2)
