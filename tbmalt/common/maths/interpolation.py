@@ -612,7 +612,8 @@ class PolyInterpU:
             # get the index of rr in grid points
             ind_last = (ind[_mask] + ninterp / 2 + 1).int()
             ind_last[ind_last > self.ngridpoint] = self.ngridpoint
-            ind_last[ind_last < ninterp] = ninterp
+            # ind_last[ind_last < ninterp] = ninterp
+            ind_last[ind_last <= ninterp] = ninterp + 1
 
             xa = (ind_last.unsqueeze(1) - ninterp + torch.arange(ninterp)
                   ) * self.incr  # get the interpolation gird points
@@ -623,31 +624,33 @@ class PolyInterpU:
         # Beyond the grid => extrapolation with polynomial of 5th order
         max_ind = self.ngridpoint - 1 + int(tail / self.incr)
         is_tail = ind.masked_fill(ind.ge(self.ngridpoint) * ind.le(max_ind), -1).eq(-1)
-        # if is_tail.any():
-        #     dr = rr[is_tail] - rmax
+        if is_tail.any():
+            dr = rr[is_tail] - rmax
 
-        #     # For input integrals, it will be 2D, such as (nsize) * (pp0, pp1),
-        #     # initial dr is 1D and will result in errors
-        #     dr = dr.repeat(self.yy.shape[1], 1).T if self.yy.dim() == 2 else dr
-        #     ilast = self.ngridpoint
+            # For input integrals, it will be 2D, such as (nsize) * (pp0, pp1),
+            # initial dr is 1D and will result in errors
+            dr = dr.repeat(self.yy.shape[1], 1).T if self.yy.dim() == 2 else dr
+            ilast = self.ngridpoint
 
-        #     # get grid points and grid point values
-        #     xa = (ilast - ninterp + torch.arange(ninterp)) * self.incr
-        #     yb = self.yy[ilast - ninterp - 1: ilast - 1]
-        #     xa = xa.repeat(dr.shape[0]).reshape(dr.shape[0], -1)
-        #     yb = yb.unsqueeze(0).repeat_interleave(dr.shape[0], dim=0)
+            # get grid points and grid point values
+            xa = (ilast - ninterp + torch.arange(ninterp)) * self.incr
+            yb = self.yy[ilast - ninterp - 1: ilast - 1]
+            xa = xa.repeat(dr.shape[0]).reshape(dr.shape[0], -1)
+            yb = yb.unsqueeze(0).repeat_interleave(dr.shape[0], dim=0)
 
-        #     # get derivative
-        #     y0 = poly_interp_2d(xa, yb, xa[:, ninterp - 1] - delta_r)
-        #     y2 = poly_interp_2d(xa, yb, xa[:, ninterp - 1] + delta_r)
-        #     y1 = self.yy[ilast - 2]
-        #     y1p = (y2 - y0) / (2.0 * delta_r)
-        #     y1pp = (y2 + y0 - 2.0 * y1) / (delta_r * delta_r)
+            # get derivative
+            y0 = poly_interp_2d(xa, yb, xa[:, ninterp - 1] - delta_r)
+            y2 = poly_interp_2d(xa, yb, xa[:, ninterp - 1] + delta_r)
+            y1 = self.yy[ilast - 2]
+            y1p = (y2 - y0) / (2.0 * delta_r)
+            y1pp = (y2 + y0 - 2.0 * y1) / (delta_r * delta_r)
 
-        #     if y1pp.dim() == 3:  # -> compression radii, not good
-        #         dr = dr.repeat(y1pp.shape[1], y1pp.shape[2], 1).transpose(-1, 0)
+            if y1pp.dim() == 3:  # -> compression radii, not good
+                dr = dr.repeat(y1pp.shape[1], y1pp.shape[2], 1).transpose(-1, 0)
+            elif y1pp.dim() == 4:  # -> compression radii, not good
+                dr = dr.repeat(y1pp.shape[1], y1pp.shape[2], 1, 1).permute(-1, 0, 1, 2)
 
-        #     result[is_tail] = poly5_zero(y1, y1p, y1pp, dr, -1.0 * tail)
+            result[is_tail] = poly5_zero(y1, y1p, y1pp, dr, -1.0 * tail)
 
         return result
 

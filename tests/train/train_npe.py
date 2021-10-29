@@ -5,6 +5,8 @@ import pickle
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
+from ase.build import molecule
+
 from tbmalt.structures.geometry import Geometry
 from tbmalt.ml.optim import OptHs, OptVcr, OptTvcr
 from tbmalt.common.parameter import params
@@ -26,14 +28,14 @@ device = torch.device('cpu')
 ###################
 # optimize params #
 ###################
-size_opt = 3
+size_opt = 30
 params['ml']['task'] = 'vcr'
 params['ml']['compression_radii_min'] = 2.0
 params['ml']['compression_radii_max'] = 9.0
 dataset_aims = './dataset/aims_6000_01.hdf'
 dataset_dftb = './dataset/scc_6000_01.hdf'
 params['ml']['targets'] = ['charge']  # charge, dipole, gap, cpa, homo_lumo
-params['ml']['max_steps'] = 5
+params['ml']['max_steps'] = 12
 h_compr_feed = True
 s_compr_feed = True
 global_r = True
@@ -115,17 +117,32 @@ def optimize_pe(dataset_ref, size, dataset_dftb=None, **kwargs):
     """Optimize spline parameters or compression radii."""
     params['ml']['lr'] = 0.001 if params['ml']['task'] == 'mlIntegral' else 0.01
     cell = torch.eye(3).repeat(size, 1, 1) * 6
+    params['dftb']['dftb2']['maxiter'] = 1
+    kpoints = torch.tensor([2, 2, 2]).repeat(size, 1)
+    klines = torch.tensor([[0.5, 0.5, -0.5, 1], [0.0, 0.0, 0.0, 4],
+                          [0.0, 0.0, 1.0, 4]]).repeat(size, 1, 1)
+
     geo_opt, data_ref = _load_ref(dataset_ref, size, [
         'charge', 'dipole', 'hirshfeld_volume_ratio'], cell=cell)
+
+
+    # h2 = molecule('H2')
+    # numbers = torch.from_numpy(h2.numbers).repeat(size, 1)
+    # positions = torch.from_numpy(h2.positions).repeat(size, 1, 1)
+    # geo_opt = Geometry(numbers, positions, cell=cell)
+    # data_ref = {'charge': torch.ones(numbers.shape),
+    #             'hirshfeld_volume_ratio': torch.ones(numbers.shape)}
+
+
     data_ref['cpa'] = data_ref['hirshfeld_volume_ratio']
-    if dataset_dftb is not None:
-        geo_dftb, data_dftb = _load_ref(
-            dataset_dftb, size, ['charge', 'dipole'], cell=cell)
+    # if dataset_dftb is not None:
+    #     geo_dftb, data_dftb = _load_ref(
+    #         dataset_dftb, size, ['charge', 'dipole'], cell=cell)
 
     # optimize integrals with spline parameters
     if params['ml']['task'] == 'mlIntegral':
         params['dftb']['path_to_skf'] = './slko/mio_new.hdf'
-        opt = OptHs(geo_opt, data_ref, params, shell_dict)
+        opt = OptHs(geo_opt, data_ref, params, shell_dict, kpoints=kpoints)
         dftb = opt(break_tolerance=break_tolerance)
 
         # save training instance
@@ -138,7 +155,7 @@ def optimize_pe(dataset_ref, size, dataset_dftb=None, **kwargs):
         params['dftb']['path_to_skf2'] = '../../slko/mio-1-1/'
         opt = OptVcr(geo_opt, data_ref, params, vcr, shell_dict,
                      h_compr_feed=h_compr_feed, s_compr_feed=s_compr_feed,
-                     interpolation='BicubInterp', global_r=global_r)
+                     interpolation='BicubInterp', global_r=global_r, kpoints=kpoints)
         dftb = opt(break_tolerance=break_tolerance)
 
         # save training instance

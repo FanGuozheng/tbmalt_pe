@@ -83,20 +83,22 @@ class Geometry:
                  frac: Union[float, List[float]] = None,
                  units: Optional[str] = 'bohr'):
 
-        if isinstance(cell, list):
-            cell = pack(cell)
-        self.atomic_numbers = pack(atomic_numbers)
+        # "pack" will only effect lists of tensors
+        self.atomic_numbers: Tensor = pack(atomic_numbers)
         self.positions: Tensor = pack(positions)
 
         # bool tensor isperiodic defines if there is solid
-        if cell is None or cell.eq(0).all():
+        if cell is None:
             self.isperiodic = False  # no system is solid
-
         else:
-            _cell = Pbc(cell, frac, units)
-            self.cell, self.periodic_list, self.frac_list, self.pbc = \
-                _cell.cell, _cell.periodic_list, _cell.frac_list, _cell.pbc
-            self.isperiodic = True if self.periodic_list.any() else False
+            cell = pack(cell)
+            if cell.eq(0).all():
+                self.isperiodic = False  # all cell is zeros
+            else:
+                _cell = Pbc(cell, frac, units)
+                self.cell, self.periodic_list, self.frac_list, self.pbc = \
+                    _cell.cell, _cell.periodic_list, _cell.frac_list, _cell.pbc
+                self.isperiodic = True if self.periodic_list.any() else False
 
         # Mask for clearing padding values in the distance matrix.
         if (temp_mask := self.atomic_numbers != 0).all():

@@ -18,7 +18,7 @@ def test_polyinterpu_single(device):
     xa = torch.linspace(0.2, 10, 50, device=device)
     yb = torch.from_numpy(data[:, 9]).to(device)
     ref = -2.7051061568285979E-002
-    fit = PolyInterpU(xa, yb, n_interp=8, n_interp_r=4)
+    fit = PolyInterpU(xa, yb)
     pred = fit(torch.tensor([4.3463697737315234], device=device))
 
     assert abs(ref - pred) < 1E-14, 'tolerance check'
@@ -26,13 +26,6 @@ def test_polyinterpu_single(device):
     # Check device: Device persistence check
     check_dev = pred.device == xa.device
     assert check_dev, 'Device of prediction is not consistent with input'
-
-    # Check n_interp
-    ref2 = -2.705744877076714E-02
-    fit.n_interp, fit.n_interp_r = 3, 2
-    pred = fit(torch.tensor([4.3463697737315234], device=device))
-
-    assert abs(ref2 - pred) < 1E-14, 'tolerance check'
 
 
 def test_polyinterpu_batch(device):
@@ -51,15 +44,6 @@ def test_polyinterpu_batch(device):
     check_dev = pred.device == xa.device
     assert check_dev, 'Device of prediction is not consistent with input'
 
-    # Check n_interp
-    ref2 = torch.tensor(
-        [-2.705744877076714E-02, -8.008294135339589E-05], device=device)
-    fit.n_interp, fit.n_interp_r = 3, 2
-    pred = fit(torch.tensor(
-        [4.3463697737315234, 8.1258217508893704], device=device))
-
-    assert (abs(ref2 - pred) < 1E-14).all(), 'tolerance check'
-
 
 def test_polyinterpu_tail(device):
     """Test the smooth Hamiltonian to zero code in the tail."""
@@ -74,20 +58,6 @@ def test_polyinterpu_tail(device):
     # Check device: Device persistence check
     check_dev = pred.device == xa.device
     assert check_dev, 'Device of prediction is not consistent with input'
-
-    # Check tail
-    fit.tail = 0.6
-    pred2 = fit(torch.tensor([10.015547739468293], device=device))
-    ref2 = torch.tensor([9.760620707717307E-06], device=device)
-
-    assert (abs(ref2 - pred2) < 1E-12).all(), 'tolerance check'
-
-    # Check delta_r
-    fit.tail, fit.delta_r = 1.0, 1E-4
-    pred3 = fit(torch.tensor([10.015547739468293], device=device))
-    ref3 = torch.tensor([1.229666474639370E-05], device=device)
-
-    assert (abs(ref3 - pred3) < 1E-13).all(), 'tolerance check'
 
 
 @pytest.mark.grad

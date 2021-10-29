@@ -80,6 +80,7 @@ class Optim:
 
         # plot loss
         plt.plot(np.linspace(1, steps, steps), loss)
+        plt.ylabel('loss')
         plt.xlabel('steps')
         plt.show()
 
@@ -99,7 +100,9 @@ class Optim:
 class OptHs(Optim):
     """Optimize integrals with spline interpolation."""
 
-    def __init__(self, geometry: Geometry, reference, parameter, shell_dict, **kwargs):
+    def __init__(self, geometry: Geometry, reference, parameter, shell_dict,
+                 skf_type: Literal['h5', 'skf'] = 'h5', **kwargs):
+        kpoints = kwargs.get('kpoints', None)
         self.basis = Basis(geometry.atomic_numbers, shell_dict)
         self.shell_dict = shell_dict
         build_abcd_h = kwargs.get('build_abcd_h', True)
@@ -121,6 +124,12 @@ class OptHs(Optim):
         super().__init__(geometry, reference, self.ml_variable, parameter,
                          **kwargs)
 
+        self.skparams = SkfParamFeed.from_dir(
+            parameter['dftb']['path_to_skf'], self.geometry, skf_type=skf_type)
+        if self.geometry.isperiodic:
+            self.periodic = Periodic(self.geometry, self.geometry.cell,
+                                     cutoff=self.skparams.cutoff, **kwargs)
+
     def __call__(self, plot: bool =True, save: bool = True, **kwargs):
         """Train spline parameters with target properties."""
         super().__call__()
@@ -140,8 +149,13 @@ class OptHs(Optim):
         return self.dftb
 
     def _update_train(self):
-        ham = hs_matrix(self.geometry, self.basis, self.h_feed)
-        over = hs_matrix(self.geometry, self.basis, self.s_feed)
+        if self.geometry.isperiodic:
+            ham = hs_matrix(self.periodic, self.basis, self.h_feed)
+            over = hs_matrix(self.periodic, self.basis, self.s_feed)
+
+        else:
+            ham = hs_matrix(self.geometry, self.basis, self.h_feed)
+            over = hs_matrix(self.geometry, self.basis, self.s_feed)
         self.dftb = Dftb2(self.params, self.geometry, self.shell_dict,
                           self.params['dftb']['path_to_skf'],
                           ham=ham, over=over, from_skf=True)
@@ -218,7 +232,9 @@ class OptVcr(Optim):
             parameter['dftb']['path_to_skf'], self.geometry, skf_type=skf_type)
         if self.geometry.isperiodic:
             self.periodic = Periodic(self.geometry, self.geometry.cell,
-                                     cutoff=self.skparams.cutoff)
+                                     cutoff=self.skparams.cutoff, **kwargs)
+        else:
+            self.periodic = None
 
 
     def __call__(self, plot: bool = True, save: bool = True, **kwargs):
@@ -260,9 +276,10 @@ class OptVcr(Optim):
             over = hs_matrix(hs_obj, self.basis, self.s_feed2)
 
         self.ham_list.append(ham.detach()), self.over_list.append(over.detach())
-        self.dftb = Dftb2(self.params, self.geometry, self.shell_dict,
+        self.dftb = Dftb2(self.geometry, self.shell_dict,
                           self.params['dftb']['path_to_skf'],
-                          H=ham, S=over, from_skf=True)
+                          hamiltonian=ham, overlap=over, from_skf=True,
+                          periodic=self.periodic)
         # self.dftb()
         super().__loss__(self.dftb)
         self._compr.append(self.compr.detach().clone())

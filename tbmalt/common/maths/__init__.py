@@ -141,7 +141,7 @@ class _SymEigB(torch.autograd.Function):
         Two different broadening methods have been  implemented within this
         class. Conditional broadening as described by Seeger [MS2019]_, and
         Lorentzian as detailed by Liao [LH2019]_. During the forward pass the
-        `torch.symeig` function is used to calculate both the eigenvalues &
+        `torch.linalg.eigh` function is used to calculate both the eigenvalues &
         the eigenvectors (U & :math:`\lambda` respectively). The gradient
         is then calculated following:
 
@@ -195,7 +195,7 @@ class _SymEigB(torch.autograd.Function):
         """Calculate the eigenvalues and eigenvectors of a symmetric matrix.
 
         Finds the eigenvalues and eigenvectors of a real symmetric
-        matrix using the torch.symeig function.
+        matrix using the torch.linalg.eigh function.
 
         Arguments:
             a: A real symmetric matrix whose eigenvalues & eigenvectors will
@@ -229,8 +229,8 @@ class _SymEigB(torch.autograd.Function):
         if method not in _SymEigB.KNOWN_METHODS:
             raise ValueError('Unknown broadening method selected.')
 
-        # Compute eigen-values & vectors using torch.symeig.
-        w, v = torch.symeig(a, eigenvectors=True)
+        # Compute eigen-values & vectors using torch.linalg.eigh.
+        w, v = torch.linalg.eigh(a)
 
         # Save tensors that will be needed in the backward pass
         ctx.save_for_backward(w, v)
@@ -277,6 +277,12 @@ class _SymEigB(torch.autograd.Function):
         else:
             bf = ctx.bf
 
+        # if bf is complex
+        if bf.dtype in (torch.complex32, torch.complex64, torch.complex128):
+            _bf = bf.real
+        else:
+            _bf = bf
+
         # Retrieve the broadening method
         bm = ctx.bm
 
@@ -291,8 +297,8 @@ class _SymEigB(torch.autograd.Function):
 
         # Apply broadening
         if bm == 'cond':  # <- Conditional broadening
-            deltas = 1 / torch.where(torch.abs(deltas) > bf,
-                                     deltas, bf) * torch.sign(deltas)
+            deltas = 1 / torch.where(torch.abs(deltas) > _bf,
+                                     deltas, _bf) * torch.sign(deltas)
         elif bm == 'lorn':  # <- Lorentzian broadening
             deltas = deltas / (deltas**2 + bf)
         elif bm == 'none':  # <- Debugging only
@@ -306,6 +312,9 @@ class _SymEigB(torch.autograd.Function):
         F = torch.zeros(*w.shape, w.shape[-1], dtype=ctx.dtype,
                         device=w_bar.device)
         # Upper then lower triangle
+        # if bf is complex
+        if bf.dtype in (torch.complex32, torch.complex64, torch.complex128):
+            deltas = torch.tensor(deltas, dtype=bf.dtype)
         F[..., tri_u[0], tri_u[1]] = deltas
         F[..., tri_u[1], tri_u[0]] -= F[..., tri_u[0], tri_u[1]]
 
@@ -418,7 +427,7 @@ def eighb(a: Tensor,
 
                 - "cond": conditional broadening. [DEFAULT='cond']
                 - "lorn": Lorentzian broadening.
-                - None: no broadening (uses torch.symeig).
+                - None: no broadening (uses torch.linalg.eigh).
 
         factor: The degree of broadening (broadening factor). [Default=1E-12]
         sort_out: If True; eigen-vector/value tensors are reordered so that
@@ -450,7 +459,7 @@ def eighb(a: Tensor,
         Two different broadening methods have been  implemented within this
         class. Conditional broadening as described by Seeger [MS2019]_, and
         Lorentzian as detailed by Liao [LH2019]_. During the forward pass the
-        `torch.symeig` function is used to calculate both the eigenvalues &
+        `torch.linalg.eigh` function is used to calculate both the eigenvalues &
         the eigenvectors (U & :math:`\lambda` respectively). The gradient
         is then calculated following:
 
@@ -497,7 +506,7 @@ def eighb(a: Tensor,
         valued eigen values will be encountered. This will **always** cause an
         error during the backwards pass unless broadening is enacted.
 
-        As ``torch.symeig`` sorts its results prior to returning them, it is
+        As ``torch.linalg.eigh`` sorts its results prior to returning them, it is
         likely that any "ghost" eigen-values/vectors, which result from zero-
         padded packing, will be located in the middle of the returned arrays.
         This makes down-stream processing more challenging. Thus, the sort_out
@@ -520,7 +529,7 @@ def eighb(a: Tensor,
 
     # Initial setup to make function calls easier to deal with
     # If smearing use _SymEigB otherwise use the internal torch.syeig function
-    func = _SymEigB.apply if broadening_method else torch.symeig
+    func = _SymEigB.apply if broadening_method else torch.linalg.eigh
     # Set up for the arguments
     args = (broadening_method, factor) if broadening_method else (True,)
 
@@ -565,6 +574,9 @@ def eighb(a: Tensor,
             l_inv_t = torch.transpose(l_inv, -1, -2)
 
             # To obtain C, perform the reduction operation C = L^{-1}AL^{-T}
+            if l_inv_t.dtype in (torch.complex32, torch.complex64, torch.complex128):
+                l_inv_t = torch.conj(l_inv_t)
+
             c = l_inv @ a @ l_inv_t
 
             # The eigenvalues of Az = λBz are the same as Cy = λy; hence:
@@ -581,7 +593,7 @@ def eighb(a: Tensor,
 
             # Embed w to construct "small b"; inverse power is also done here
             # to avoid inf values later on.
-            b_small = torch.diag_embed(w ** -0.5)
+            b_small = torch.diag_embed(w ** -0.5).to(v.dtype)
 
             # Construct symmetric orthogonalisation matrix via:
             #   B^{-1/2} = V b^{-1/2} V^{T}

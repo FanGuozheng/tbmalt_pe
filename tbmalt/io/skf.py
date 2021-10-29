@@ -360,6 +360,7 @@ class Skf:
             # Loop over field names (strings like "ℓ₁-ℓ₂") & their numpy arrays
             for n in i.dtype.fields.keys()}
             for i in [ints['H'], ints['S']])
+
         grid = (torch.arange(0, ints['count'][()], **dd) + 1) * ints['step'][()]
         hs_cut = grid[-1] - ints['step'][()]
 

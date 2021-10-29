@@ -1,7 +1,8 @@
 import torch
 import pytest
-from tbmalt.tests.test_utils import *
 from torch.autograd import gradcheck
+
+from tests.test_utils import *
 from tbmalt.common.maths.mixer import Simple, Anderson
 torch.set_default_dtype(torch.float64)
 torch.set_printoptions(15)
