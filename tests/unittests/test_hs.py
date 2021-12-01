@@ -164,21 +164,14 @@ def test_h2o_pe(device):
     """Test single Hamiltonian and overlap after SK transformations."""
     h_h2o = _get_matrix('./tests/unittests/data/sk/h2o/hamsqr1.dat.pe', device)
     s_h2o = _get_matrix('./tests/unittests/data/sk/h2o/oversqr.dat.pe', device)
-    h_h2o2 = _get_matrix('./tests/unittests/data/sk/h2o/hamsqr1.dat.pe122', device)
-    s_h2o2 = _get_matrix('./tests/unittests/data/sk/h2o/oversqr.dat.pe122', device)
     h_h2 = _get_matrix('./tests/unittests/data/sk/h2/hamsqr1.dat.pe', device)
     s_h2 = _get_matrix('./tests/unittests/data/sk/h2/oversqr.dat.pe', device)
     path_sk = './tests/unittests/data/slko/mio'
     kpoints = torch.tensor([[1, 1, 1], [1, 1, 1]])
-    kpoints2 = torch.tensor([[1, 2, 2]])
     geometry = Geometry(torch.tensor([[8, 1, 1], [1, 1, 0]]), torch.tensor([[
         [0, 0, 0], [0, 0.6, 0], [0, 0., 0.6]], [[0, 0, 0], [0, 0, 0.6], [0, 0, 0]]]),
         cell=torch.eye(3).unsqueeze(0).repeat(2, 1, 1) * 6.0, units='angstrom')
     basis = Basis(geometry.atomic_numbers, shell_dict)
-    geometry2 = Geometry(torch.tensor([[8, 1, 1]]), torch.tensor([[
-        [0, 0, 0], [0, 0.6, 0], [0, 0., 0.6]]]),
-        cell=torch.eye(3).unsqueeze(0) * 6.0, units='angstrom')
-    basis2 = Basis(geometry2.atomic_numbers, shell_dict)
 
     # build single Hamiltonian and overlap feeds
     h_feed = SkfFeed.from_dir(
@@ -190,13 +183,11 @@ def test_h2o_pe(device):
     skparams = SkfParamFeed.from_dir(path_sk, geometry, skf_type='skf')
     periodic = Periodic(geometry, geometry.cell, cutoff=skparams.cutoff,
                         kpoints=kpoints)
-    periodic2 = Periodic(geometry2, geometry2.cell, cutoff=skparams.cutoff,
-                         kpoints=kpoints2)
 
     ham = hs_matrix(periodic, basis, h_feed)
     over = hs_matrix(periodic, basis, s_feed)
-    ham2 = hs_matrix(periodic2, basis2, h_feed)
-    over2 = hs_matrix(periodic2, basis2, s_feed)
+    # ham2 = hs_matrix(periodic2, basis2, h_feed)
+    # over2 = hs_matrix(periodic2, basis2, s_feed)
 
     ind_h2o = torch.arange(0, h_h2o.shape[-1], 2)
     ind_h2 = torch.arange(0, h_h2.shape[-1], 2)
@@ -208,14 +199,6 @@ def test_h2o_pe(device):
         ham.imag.squeeze()[0] - h_h2o[..., ind_h2o + 1])) < 1E-12
     check_is_h2o = torch.max(abs(
         over.imag.squeeze()[0] - s_h2o[..., ind_h2o + 1])) < 1E-11
-    check_h_h2o2 = torch.max(abs(
-        ham2.real.squeeze()[..., 0] - h_h2o2[:6, ind_h2o])) < 1E-12
-    check_s_h2o2 = torch.max(abs(
-        over2.real.squeeze()[..., 0] - s_h2o2[:6, ind_h2o])) < 1E-11
-    check_ih_h2o2 = torch.max(abs(
-        ham2.imag.squeeze()[..., 0] - h_h2o2[:6, ind_h2o + 1])) < 1E-12
-    check_is_h2o2 = torch.max(abs(
-        over2.imag.squeeze()[..., 0] - s_h2o2[:6, ind_h2o + 1])) < 1E-11
     check_is_h2o = torch.max(abs(
         over.imag.squeeze()[0] - s_h2o[..., ind_h2o + 1])) < 1E-11
     check_h_h2 = torch.max(abs(
@@ -229,12 +212,8 @@ def test_h2o_pe(device):
     assert check_s_h2o, 'real S tolerance check'
     assert check_ih_h2o, 'imaginary H tolerance check'
     assert check_is_h2o, 'imaginary S tolerance check'
-    assert check_h_h2o2, 'real H tolerance check'
-    assert check_s_h2o2, 'real S tolerance check'
     assert check_h_h2, 'real H tolerance check'
     assert check_s_h2, 'real S tolerance check'
-    assert check_ih_h2o2, 'imaginary H tolerance check'
-    assert check_is_h2o2, 'imaginary S tolerance check'
     assert check_persistence_h, 'device persistence_ check'
     assert check_persistence_s, 'device persistence_ check'
 
