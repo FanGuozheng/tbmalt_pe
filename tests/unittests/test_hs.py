@@ -16,10 +16,21 @@ from tbmalt.physics.dftb.slaterkoster import hs_matrix
 from tbmalt.structures.periodic import Periodic
 from tbmalt.common.batch import pack
 torch.set_default_dtype(torch.float64)
-torch.set_printoptions(4)
+torch.set_printoptions(6)
 
 shell_dict = {1: [0], 6: [0, 1], 7: [0, 1], 8: [0, 1],
               14: [0, 1], 22: [0, 1, 2]}
+
+
+def _get_matrix(filename, device, in_type='txt'):
+    """Read DFTB+ hamsqr1.dat and oversqr.dat."""
+    if in_type == 'txt':
+        return torch.from_numpy(np.loadtxt(filename)).to(device)
+    else:
+        text = ''.join(open(filename, 'r').readlines())
+        string = re.search('(?<=MATRIX\n).+(?=\n)', text, flags=re.DOTALL).group(0)
+        return torch.tensor([[float(i) for i in row.split()]
+                             for row in string.split('\n')]).to(device)
 
 
 def test_hs_single_npe(device):
@@ -68,8 +79,8 @@ def test_hs_single_npe(device):
     check_persistence_h2 = ham2.device == torch.device('cpu')
     check_persistence_s2 = over2.device == torch.device('cpu')
 
-    assert check_h2, 'Hamiltonian are outside of permitted tolerance thresholds'
-    assert check_s2, 'Overlap are outside of permitted tolerance thresholds'
+    assert check_h2, 'Hamiltonian tolerance failed'
+    assert check_s2, 'Overlap tolerance failed'
     assert check_persistence_h2, 'Device persistence check failed'
     assert check_persistence_s2, 'Device persistence check failed'
 
@@ -113,8 +124,10 @@ def test_h2_pe(device):
         [0, 0, 0], [0, 0, 0.6]]]), cell=torch.eye(3).unsqueeze(0) * 6.0,
         units='angstrom')
     basis = Basis(geometry.atomic_numbers, shell_dict)
-    geometry2 = Geometry(torch.tensor([[1, 1, 1]]), torch.tensor([[
-        [0, 0, 0], [0, 0, 0.6], [0, 0, 1.2]]]), cell=torch.eye(3).unsqueeze(0) * 6.0,
+    geometry2 = Geometry(
+        torch.tensor([[1, 1, 1]]), torch.tensor([[
+            [0, 0, 0], [0, 0, 0.6], [0, 0, 1.2]]]),
+        cell=torch.eye(3).unsqueeze(0) * 6.0,
         units='angstrom')
     basis2 = Basis(geometry2.atomic_numbers, shell_dict)
 
@@ -129,7 +142,7 @@ def test_h2_pe(device):
     periodic = Periodic(geometry, geometry.cell, cutoff=skparams.cutoff,
                         kpoints=kpoints)
     periodic2 = Periodic(geometry2, geometry2.cell, cutoff=skparams.cutoff,
-                        kpoints=kpoints2)
+                         kpoints=kpoints2)
 
     ham = hs_matrix(periodic, basis, h_feed)
     over = hs_matrix(periodic, basis, s_feed)
@@ -140,11 +153,16 @@ def test_h2_pe(device):
     ind_r2 = torch.arange(0, h_h22.shape[-1], 2)
     check_h_r = torch.max(abs(ham.real.squeeze() - h_h2[..., ind_r])) < 1E-14
     check_s_r = torch.max(abs(over.real.squeeze() - s_h2[..., ind_r])) < 1E-11
-    check_ih_r = torch.max(abs(ham.imag.squeeze() - h_h2[..., ind_r + 1])) < 1E-14
-    check_is_r = torch.max(abs(over.imag.squeeze() - s_h2[..., ind_r + 1])) < 1E-11
-    check_h_r2 = torch.max(abs(ham2.real.squeeze()[..., 0] - h_h22[:3, ind_r2])) < 1E-14
-    check_ih_r2 = torch.max(abs(ham2.imag.squeeze()[..., 0] - h_h22[:3, ind_r2 + 1])) < 1E-14
-    check_s_r2 = torch.max(abs(over2.real.squeeze()[..., 0] - s_h22[:3, ind_r2])) < 1E-11
+    check_ih_r = torch.max(
+        abs(ham.imag.squeeze() - h_h2[..., ind_r + 1])) < 1E-14
+    check_is_r = torch.max(abs(
+        over.imag.squeeze() - s_h2[..., ind_r + 1])) < 1E-11
+    check_h_r2 = torch.max(
+        abs(ham2.real.squeeze()[..., 0] - h_h22[:3, ind_r2])) < 1E-14
+    check_ih_r2 = torch.max(
+        abs(ham2.imag.squeeze()[..., 0] - h_h22[:3, ind_r2 + 1])) < 1E-14
+    check_s_r2 = torch.max(
+        abs(over2.real.squeeze()[..., 0] - s_h22[:3, ind_r2])) < 1E-11
     # print(ham2.imag.squeeze()[..., 0], '\n', h_h22[:3, ind_r2 + 1])
     check_persistence_h = ham.device == device
     check_persistence_s = over.device == device
@@ -477,6 +495,96 @@ def test_si_pe(device):
     assert check_persistence_s_pe, 'device check'
 
 
+def test_ch3cho(device):
+    """Test TiO2."""
+    h_tio2 = _get_matrix('./tests/unittests/data/sk/ch3cho/hamsqr1.dat', device)
+    s_tio2 = _get_matrix('./tests/unittests/data/sk/ch3cho/oversqr.dat', device)
+    geometry = Geometry.from_ase_atoms([molecule('CH3CHO')])
+
+    path_sk = './tests/unittests/data/slko/mio'
+    basis = Basis(geometry.atomic_numbers, shell_dict)
+
+    # build single Hamiltonian and overlap feeds
+    h_feed = SkfFeed.from_dir(
+        path_sk, shell_dict, skf_type='skf',
+        geometry=geometry, interpolation='PolyInterpU', integral_type='H')
+    s_feed = SkfFeed.from_dir(
+        path_sk, shell_dict, skf_type='skf',
+        geometry=geometry, interpolation='PolyInterpU', integral_type='S')
+
+    ham = hs_matrix(geometry, basis, h_feed)
+    over = hs_matrix(geometry, basis, s_feed)
+
+    check_h_tio2 = torch.max(abs(ham.squeeze() - h_tio2)) < 1E-14
+    check_s_tio2 = torch.max(abs(over.squeeze() - s_tio2)) < 1E-14
+
+    check_persistence_h = ham.device == device
+    check_persistence_s = over.device == device
+
+    assert check_h_tio2, 'real H tolerance check'
+    assert check_s_tio2, 'real S tolerance check'
+    check_persistence_h, 'device check'
+    check_persistence_s, 'device check'
+
+
+def test_tio2(device):
+    """Test TiO2."""
+    h_tio2 = _get_matrix('./tests/unittests/data/sk/tio2/hamsqr1.dat', device)
+    s_tio2 = _get_matrix('./tests/unittests/data/sk/tio2/oversqr.dat', device)
+    geometry = Geometry(
+        torch.tensor([[22, 22, 8, 8, 8, 8]]),
+        torch.tensor([[
+            [2.783207184819172, -0.000000000099763, 1.344461013714925],
+            [0.000000000000000, 0.000000000000000, 0.000000000000000],
+            [4.542807941001271, 0.970773411850806, 1.344461013714925],
+            [6.775397066812810, 3.737993010494626, 0.000000000000000],
+            [1.023606428637073, -0.970773412050332, 1.344461013714925],
+            [1.759600756182100, 0.970773411950569, 0.000000000000000]]]),
+        cell=torch.tensor([[
+            [5.566414370000000, 0.000000000000000, 0.000000000000000],
+            [2.968583452994909, 4.708766422445195, 0.000000000000000],
+            [-4.267498911859111, -2.354383211422124, 2.688922027429850]]]),
+        units='angstrom')
+
+    path_sk = './tests/unittests/data/slko/tiorg'
+    kpoints = torch.tensor([[1, 1, 1]])
+    basis = Basis(geometry.atomic_numbers, shell_dict)
+
+    # build single Hamiltonian and overlap feeds
+    h_feed = SkfFeed.from_dir(
+        path_sk, shell_dict, skf_type='skf',
+        geometry=geometry, interpolation='PolyInterpU', integral_type='H')
+    s_feed = SkfFeed.from_dir(
+        path_sk, shell_dict, skf_type='skf',
+        geometry=geometry, interpolation='PolyInterpU', integral_type='S')
+    skparams = SkfParamFeed.from_dir(path_sk, geometry, skf_type='skf')
+    periodic = Periodic(geometry, geometry.cell, cutoff=skparams.cutoff,
+                        kpoints=kpoints)
+
+    ham = hs_matrix(periodic, basis, h_feed)
+    over = hs_matrix(periodic, basis, s_feed)
+
+    ind_tio2 = torch.arange(0, h_tio2.shape[-1], 2)
+    check_h_tio2 = torch.max(abs(
+        ham.real.squeeze() - h_tio2[..., ind_tio2])) < 3E-9
+    check_s_tio2 = torch.max(abs(
+        over.real.squeeze() - s_tio2[..., ind_tio2])) < 5E-9
+    check_ih_tio2 = torch.max(abs(
+        ham.imag.squeeze() - h_tio2[..., ind_tio2 + 1])) < 1E-9
+    check_is_tio2 = torch.max(abs(
+        over.imag.squeeze() - s_tio2[..., ind_tio2 + 1])) < 1E-9
+
+    check_persistence_h = ham.device == device
+    check_persistence_s = over.device == device
+
+    assert check_h_tio2, 'real H tolerance check'
+    assert check_s_tio2, 'real S tolerance check'
+    assert check_ih_tio2, 'imaginary H tolerance check'
+    assert check_is_tio2, 'imaginary S tolerance check'
+    check_persistence_h, 'device check'
+    check_persistence_s, 'device check'
+
+
 def test_hs_matrix_hdf_npe(device):
     """Test single Hamiltonian and overlap after SK transformations."""
     h_ch4 = _get_matrix('./tests/unittests/data/sk/ch4/hamsqr1.dat', device)
@@ -672,14 +780,3 @@ def test_hs_matrix_batch_npe(device):
 
 #     assert grad_h, 'Hamiltonian gradient stability test failed.'
 #     assert grad_s, 'Overlap gradient stability test failed.'
-
-
-def _get_matrix(filename, device, in_type='txt'):
-    """Read DFTB+ hamsqr1.dat and oversqr.dat."""
-    if in_type == 'txt':
-        return torch.from_numpy(np.loadtxt(filename)).to(device)
-    else:
-        text = ''.join(open(filename, 'r').readlines())
-        string = re.search('(?<=MATRIX\n).+(?=\n)', text, flags=re.DOTALL).group(0)
-        return torch.tensor([[float(i) for i in row.split()]
-                              for row in string.split('\n')]).to(device)

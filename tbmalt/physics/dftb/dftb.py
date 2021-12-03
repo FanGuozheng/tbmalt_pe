@@ -4,7 +4,7 @@ implement pytorch to DFTB
 """
 from typing import Literal, Optional
 import torch
-from tbmalt import Basis, SkfParamFeed
+from tbmalt import Basis, Geometry, SkfParamFeed
 import tbmalt.common.maths as maths
 from tbmalt import SkfFeed, hs_matrix
 from tbmalt.ml.skfeeds import VcrFeed, TvcrFeed
@@ -21,48 +21,61 @@ Tensor = torch.Tensor
 
 
 class Dftb:
-    """Density functional based tight binding method template class."""
+    """Density functional based tight binding method template class.
+
+    The `Dftb` is designed to calculate high-throughput DFTB calculations, the
+    input will be transfered to batch to avoid a lot of `if` or `else`. To
+    make sure the DFTB results could be easily used by other framework, the
+    output will be transfered to single if the input is single.
+
+    Arguments:
+        geometry: `Geometry` object in TBMaLT.
+        shell_dict : The angular momenta of each shell.
+        path_to_skf: Path to Slater-Koster files.
+        hamiltonian: Hamiltonian Tensor.
+        overlap: overlap Tensor.
+        skf_type: The type of input Slater-Koster files.
+        basis_type: The type of basis.
+        mixer: Type of mixers.
+
+    """
 
     def __init__(self,
-                 geometry: object,
+                 geometry: Geometry,
                  shell_dict: dict,
                  path_to_skf: str,
                  hamiltonian: Optional[Tensor] = None,
                  overlap: Optional[Tensor] = None,
                  skf_type: Literal['h5', 'skf'] = 'h5',
                  basis_type: Literal['normal', 'vcr', 'tvcr'] = 'normal',
-                 periodic=None,
                  mixer: Literal['Simple', 'Anderson'] = 'Anderson',
                  **kwargs):
-
+        # General parameters
         self.mixer_type = mixer
         self.geometry = geometry
         self.batch = True if self.geometry.distances.dim() == 3 else False
-
         self.basis = Basis(geometry.atomic_numbers, shell_dict)
 
         hsfeed = {'normal': SkfFeed, 'vcr': VcrFeed, 'tvcr': TvcrFeed}[basis_type]
         _grids = kwargs.get('grids', None)
         _interp = kwargs.get('interpolation', 'PolyInterpU')
 
+        # Max iterative SCC steps
         maxiter = kwargs.get('maxiter', 60)
         self.maxiter = maxiter if self.method in ('Dftb2', 'Dftb3') else 1
 
         # Create periodic related routine
         self.skparams = SkfParamFeed.from_dir(
             path_to_skf, geometry, skf_type=skf_type)
-        if self.geometry.isperiodic and periodic is None:
+        if self.geometry.isperiodic:
             self.periodic = Periodic(self.geometry, self.geometry.cell,
-                                      cutoff=self.skparams.cutoff, **kwargs)
-            self.coulomb = Coulomb(self.geometry, self.periodic, method='search')
-            hs_obj = self.periodic  # TEMP CODE!!!
-        elif self.geometry.isperiodic:
-            self.periodic = periodic
+                                     cutoff=self.skparams.cutoff, **kwargs)
             self.coulomb = Coulomb(self.geometry, self.periodic, method='search')
             hs_obj = self.periodic  # TEMP CODE!!!
         else:
             hs_obj = self.geometry
 
+        # initialize hamiltonian and overlap
         multi_varible = kwargs.get('multi_varible', None)
         if hamiltonian is None:
             h_feed = hsfeed.from_dir(
@@ -93,8 +106,8 @@ class Dftb:
         self.nelectron = self.qzero.sum(axis=1)
 
         assert self.mixer_type in ('Anderson', 'Simple')
-        # globals()[self.mixer_type](self.qzero).__dict__.update(self.mixer_type)
-        self.mixer = globals()[self.mixer_type](self.qzero, return_convergence=True)
+        self.mixer = globals()[self.mixer_type](
+            self.qzero, return_convergence=True)
 
         if self.geometry.isperiodic:
             self.distances = self.periodic.periodic_distances
@@ -106,8 +119,9 @@ class Dftb:
 
         if self.method in ('Dftb2', 'Dftb3', 'xlbomd'):
             self.method = kwargs.get('gamma_method', 'read')
-            self.gamma = Gamma(self.u, self.distances, self.geometry.atomic_numbers,
-                               self.periodic, method=self.method).gamma
+            self.gamma = Gamma(
+                self.u, self.distances, self.geometry.atomic_numbers,
+                self.periodic, method=self.method).gamma
         else:
             self.gamma = torch.zeros(*self.qzero.shape)
 
@@ -146,14 +160,58 @@ class Dftb:
         # calculate mulliken charges for each system in batch
         return mulliken(overlap, self.rho, self.basis.orbs_per_atom[self.mask])
 
+    def _expand_u(self, u):
+        """Expand Hubbert U for periodic system."""
+        shape_cell = self.distances.shape[1]
+        return u.repeat(shape_cell, 1, 1).transpose(0, 1)
+
+    def _get_shift(self):
+        """Return shift term for periodic and non-periodic."""
+        if not self.geometry.isperiodic:
+            return self.inv_dist - self.gamma
+        else:
+            return self.coulomb.invrmat - self.gamma
+
+    def _update_shift(self):
+        """Update shift."""
+        return torch.stack([(im - iz) @ ig for im, iz, ig in zip(
+            self.charge[self.mask], self.qzero[self.mask], self.shift[self.mask])])
+
+    def _update_scc(self, qmix, epsilon, eigvec, nocc):
+        """Update charge according to convergence in last step."""
+        self.charge[self.mask] = qmix
+        self.nocc[self.mask] = nocc
+        self.density[self.mask, :self.rho.shape[1], :self.rho.shape[2]] = self.rho
+
+    def _update_scc_ik(self, epsilon, eigvec, _over, this_size,
+                       iiter, ik=None, n_kpoints=None):
+        """Update data for each kpoints."""
+        if iiter == 0:
+            if n_kpoints is None:
+                self.epsilon = torch.zeros(*epsilon.shape)
+                self.eigenvector = torch.zeros(*eigvec.shape, dtype=self.dtype)
+            elif ik == 0:
+                self.epsilon = torch.zeros(*epsilon.shape, n_kpoints)
+                self.eigenvector = torch.zeros(
+                    *eigvec.shape, n_kpoints, dtype=self.dtype)
+
+        if ik is None:
+            self.epsilon[self.mask, :epsilon.shape[1]] = epsilon
+            self.eigenvector[
+                self.mask, :eigvec.shape[1], :eigvec.shape[2]] = eigvec
+        else:
+            self.epsilon[self.mask, :epsilon.shape[1], ik] = epsilon
+            self.eigenvector[
+                self.mask, :eigvec.shape[1], :eigvec.shape[2], ik] = eigvec
+
     @property
     def mulliken_charge(self) -> Tensor:
-        return self._charge.squeeze(0)
+        return self.charge.squeeze(0)
 
     @property
     def dipole(self) -> Tensor:
         """Return dipole moments."""
-        return torch.sum((self.qzero - self._charge).unsqueeze(-1) *
+        return torch.sum((self.qzero - self.charge).unsqueeze(-1) *
                          self.geometry.positions, 1).squeeze(0)
 
     @property
@@ -196,8 +254,9 @@ class Dftb:
         nat = self.geometry._n_batch
         numbers = self.geometry.numbers
 
-        return pack([1.0 + (onsite[ib] - self.qzero[ib])[:nat[ib]] / numbers[ib][:nat[ib]]
-                     for ib in range(self.geometry.size_batch)]).squeeze(0)
+        return pack([1.0 + (onsite[ib] - self.qzero[
+            ib])[:nat[ib]] / numbers[ib][:nat[ib]]
+            for ib in range(self.geometry.size_batch)]).squeeze(0)
 
     @property
     def ini_charge(self):
@@ -236,7 +295,8 @@ class Dftb:
     def pdos(self):
         """Return PDOS."""
         energy = torch.linspace(-1, 1, 200)
-        return pdos(self.eigenvector, self.over, self.eigenvalue, energy).squeeze(0)
+        return pdos(
+            self.eigenvector, self.over, self.eigenvalue, energy).squeeze(0)
 
     @property
     def dos(self, sigma: float = 0.1):
@@ -259,7 +319,8 @@ class Dftb:
             n_homo = n_homo.repeat(self.eigenvalue.shape[0])
             n_lumo = n_lumo.repeat(self.eigenvalue.shape[0])
 
-            return band_pass_state_filter(self.eigenvalue, n_homo, n_lumo, self.fermi)
+            return band_pass_state_filter(
+                self.eigenvalue, n_homo, n_lumo, self.fermi)
 
 
 class Dftb1(Dftb):
@@ -273,11 +334,10 @@ class Dftb1(Dftb):
                  overlap: Optional[Tensor] = None,
                  skf_type: Literal['h5', 'skf'] = 'h5',
                  basis_type: Literal['normal', 'vcr', 'tvcr'] = 'normal',
-                 periodic=None,
                  mixer: Literal['Simple', 'Anderson'] = 'Anderson',
                  **kwargs):
 
-        self.method = 'Dftb1'
+        self.method = 'Dftb2'
         self.geometry = geometry
 
         self.basis = Basis(geometry.atomic_numbers, shell_dict)
@@ -286,12 +346,93 @@ class Dftb1(Dftb):
             not self.geometry.isperiodic else torch.complex128
 
         super().__init__(geometry, shell_dict, path_to_skf,
-                         hamiltonian, overlap, skf_type, basis_type, periodic,
+                         hamiltonian, overlap, skf_type, basis_type,
                          mixer, **kwargs)
 
         super().init_dftb(**kwargs)
 
         self._scc()
+
+    def _scc(self, iiter=0):
+        """"""
+        # get shift and repeat shift according to number of orbitals
+        shift_ = self._update_shift()
+        shiftorb_ = pack([ishif.repeat_interleave(iorb) for iorb, ishif in
+                          zip(self.atom_orbitals[self.mask], shift_)])
+        shift_mat = torch.stack([torch.unsqueeze(ishift, 1) + ishift
+                                 for ishift in shiftorb_])
+        if self.geometry.isperiodic:
+            shift_mat = shift_mat.repeat(torch.max(
+                self.periodic.n_kpoints), 1, 1, 1).permute(1, 2, 3, 0)
+
+        # For molecule, the shift_mat will be [n_batch, n_size, n_size]
+        # For solid, the size is [n_batch, n_size, n_size, n_kpt]
+        this_size = shift_mat.shape[-2]
+        fock = self.ham[self.mask, :this_size, :this_size] + \
+            0.5 * self.over[self.mask, :this_size, :this_size] * shift_mat
+
+        # calculate the eigen-values & vectors via a Cholesky decomposition
+        if not self.geometry.isperiodic:
+            epsilon, eigvec = maths.eighb(
+                fock, self.over[self.mask, :this_size, :this_size])
+            self._update_scc_ik(epsilon, eigvec, self.over, this_size, iiter)
+            occ, nocc = fermi(epsilon, self.nelectron[self.mask])
+
+            # eigenvector with Fermi-Dirac distribution
+            c_scaled = torch.sqrt(occ).unsqueeze(1).expand_as(eigvec) * eigvec
+            self.rho = c_scaled @ c_scaled.transpose(1, 2)  # -> density
+
+            if iiter == 0:
+                self.nocc = torch.zeros(*nocc.shape)
+                self.density = torch.zeros(
+                    *self.rho.shape, dtype=self.rho.dtype)
+
+            # # calculate mulliken charges for each system in batch
+            q_new = mulliken(self.over[self.mask, :this_size, :this_size],
+                             self.rho, self.atom_orbitals[self.mask])
+        else:
+            self.ie, eigvec, nocc, density, q_new = [], [], [], [], []
+            self._mask_k = []
+
+            # Loop over all K-points
+            for ik in range(self.max_nk):
+
+                # calculate the eigen-values & vectors
+                iep, ieig = maths.eighb(
+                    fock[..., ik],
+                    self.over[self.mask, :this_size, :this_size, ik])
+                self.ie.append(iep), eigvec.append(ieig)
+                self._update_scc_ik(
+                    iep, ieig, self.over[..., ik],
+                    this_size, iiter, ik, torch.max(self.periodic.n_kpoints))
+
+                iocc, inocc = fermi(iep, self.nelectron[self.mask])
+                nocc.append(inocc)
+                iden = torch.sqrt(iocc).unsqueeze(1).expand_as(ieig) * ieig
+                irho = (torch.conj(iden) @ iden.transpose(1, 2))  # -> density
+                density.append(irho)
+
+                # calculate mulliken charges for each system in batch
+                iq = mulliken(self.over[self.mask, :this_size, :this_size, ik],
+                              irho, self.atom_orbitals[self.mask])
+
+                _q = iq.real
+                q_new.append(_q)
+
+            nocc = pack(nocc).T
+            self.rho = pack(density).permute(1, 2, 3, 0)
+            if iiter == 0:
+                self.nocc = torch.zeros(*nocc.shape)
+                self.density = torch.zeros(
+                    *self.rho.shape, dtype=self.rho.dtype)
+
+            q_new = (pack(q_new).permute(2, 1, 0) * self.periodic.k_weights[
+                self.mask]).sum(-1).T
+            # self.qmix, self.converge = self.mixer(q_new)
+
+            epsilon = pack(self.ie)
+
+        self._update_scc(q_new, epsilon, eigvec, nocc)
 
 
 class Dftb2(Dftb):
@@ -300,7 +441,6 @@ class Dftb2(Dftb):
     Arguments:
         geometry: Object contains geometry and orbital information.
         skt: Object contains SK data.
-        parameter: Object which return DFTB and ML parameters.
 
     Examples:
         >>> from ase.build import molecule as molecule_database
@@ -327,7 +467,6 @@ class Dftb2(Dftb):
                  overlap: Optional[Tensor] = None,
                  skf_type: Literal['h5', 'skf'] = 'h5',
                  basis_type: Literal['normal', 'vcr', 'tvcr'] = 'normal',
-                 periodic=None,
                  mixer: Literal['Simple', 'Anderson'] = 'Anderson',
                  **kwargs):
 
@@ -339,9 +478,8 @@ class Dftb2(Dftb):
         self.dtype = self.geometry.positions.dtype if \
             not self.geometry.isperiodic else torch.complex128
 
-        super().__init__(geometry, shell_dict, path_to_skf,
-                         hamiltonian, overlap, skf_type, basis_type, periodic,
-                         mixer, **kwargs)
+        super().__init__(geometry, shell_dict, path_to_skf, hamiltonian,
+                         overlap, skf_type, basis_type, mixer, **kwargs)
 
         super().init_dftb(**kwargs)
 
@@ -380,7 +518,8 @@ class Dftb2(Dftb):
 
                 if iiter == 0:
                     self.nocc = torch.zeros(*nocc.shape)
-                    self.density = torch.zeros(*self.rho.shape, dtype=self.rho.dtype)
+                    self.density = torch.zeros(
+                        *self.rho.shape, dtype=self.rho.dtype)
 
                 # calculate mulliken charges for each system in batch
                 q_new = mulliken(self.over[self.mask, :this_size, :this_size],
@@ -396,21 +535,23 @@ class Dftb2(Dftb):
 
                     # calculate the eigen-values & vectors
                     iep, ieig = maths.eighb(
-                        fock[..., ik], self.over[self.mask, :this_size, :this_size, ik])
+                        fock[..., ik],
+                        self.over[self.mask, :this_size, :this_size, ik])
                     self.ie.append(iep), eigvec.append(ieig)
                     self._update_scc_ik(
-                        iep, ieig, self.over[..., ik],
-                        this_size, iiter, ik, torch.max(self.periodic.n_kpoints))
+                        iep, ieig, self.over[..., ik], this_size, iiter,
+                        ik, torch.max(self.periodic.n_kpoints))
 
                     iocc, inocc = fermi(iep, self.nelectron[self.mask])
                     nocc.append(inocc)
                     iden = torch.sqrt(iocc).unsqueeze(1).expand_as(ieig) * ieig
-                    irho = (torch.conj(iden) @ iden.transpose(1, 2))  # -> density
+                    irho = (torch.conj(iden) @ iden.transpose(1, 2))
                     density.append(irho)
 
                     # calculate mulliken charges for each system in batch
-                    iq = mulliken(self.over[self.mask, :this_size, :this_size, ik],
-                                  irho, self.atom_orbitals[self.mask])
+                    iq = mulliken(
+                        self.over[self.mask, :this_size, :this_size, ik],
+                        irho, self.atom_orbitals[self.mask])
 
                     _q = iq.real
                     q_new.append(_q)
@@ -419,71 +560,19 @@ class Dftb2(Dftb):
                 self.rho = pack(density).permute(1, 2, 3, 0)
                 if iiter == 0:
                     self.nocc = torch.zeros(*nocc.shape)
-                    self.density = torch.zeros(*self.rho.shape, dtype=self.rho.dtype)
+                    self.density = torch.zeros(
+                        *self.rho.shape, dtype=self.rho.dtype)
 
-                q_new = (pack(q_new).permute(2, 1, 0) * self.periodic.k_weights[self.mask]).sum(-1).T
+                q_new = (pack(q_new).permute(2, 1, 0) *
+                         self.periodic.k_weights[self.mask]).sum(-1).T
                 self.qmix, self.converge = self.mixer(q_new)
-
                 epsilon = pack(self.ie)
 
+            # Update charge, convergence
             self._update_scc(self.qmix, epsilon, eigvec, nocc)
-
+            self.mask = ~self.converge
             if (self.converge == True).all():
                 break
-
-    def _update_scc_ik(self, epsilon, eigvec, _over, this_size, iiter, ik=None, n_kpoints=None):
-        """"""
-        if iiter == 0:
-            if n_kpoints is None:
-                self.epsilon = torch.zeros(*epsilon.shape)
-                self.eigenvector = torch.zeros(*eigvec.shape, dtype=self.dtype)
-            elif ik == 0:
-                self.epsilon = torch.zeros(*epsilon.shape, n_kpoints)
-                self.eigenvector = torch.zeros(*eigvec.shape, n_kpoints, dtype=self.dtype)
-
-        if ik is None:
-            self.epsilon[self.mask, :epsilon.shape[1]] = epsilon
-            self.eigenvector[self.mask, :eigvec.shape[1], :eigvec.shape[2]] = eigvec
-        else:
-            self.epsilon[self.mask, :epsilon.shape[1], ik] = epsilon
-            self.eigenvector[self.mask, :eigvec.shape[1], :eigvec.shape[2], ik] = eigvec
-
-    def _update_scc(self, qmix, epsilon, eigvec, nocc):
-        """Update charge according to convergence in last step."""
-        self.charge[self.mask] = qmix
-        self.nocc[self.mask] = nocc
-        self.density[self.mask, :self.rho.shape[1], :self.rho.shape[2]] = self.rho
-
-        self.mask = ~self.converge
-
-
-    def _update_charge(self, qmix):
-        """Update charge according to convergence in last step."""
-        self.charge[self.mask] = qmix
-        self.mask = ~self.converge
-
-    def _inv_distance(self, distance):
-        _inv_distance = torch.zeros(*distance.shape)
-        mask = distance.ne(0.0)
-        _inv_distance[mask] = 1.0 / distance[mask]
-        return _inv_distance
-
-    def _get_shift(self):
-        """Return shift term for periodic and non-periodic."""
-        if not self.geometry.isperiodic:
-            return self.inv_dist - self.gamma
-        else:
-            return self.coulomb.invrmat - self.gamma
-
-    def _update_shift(self):
-        """Update shift."""
-        return torch.stack([(im - iz) @ ig for im, iz, ig in zip(
-            self.charge[self.mask], self.qzero[self.mask], self.shift[self.mask])])
-
-    def _expand_u(self, u):
-        """Expand Hubbert U for periodic system."""
-        shape_cell = self.distances.shape[1]
-        return u.repeat(shape_cell, 1, 1).transpose(0, 1)
 
 
 class Dftb3(Dftb):

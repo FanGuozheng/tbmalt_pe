@@ -1,11 +1,9 @@
 """Test SCC DFTB."""
 import torch
-import os
 import pytest
 from torch.autograd import gradcheck
 from ase.build import molecule
-from tbmalt import Geometry, Basis, SkfFeed, Dftb1, Dftb2
-from tbmalt.common.parameter import params
+from tbmalt import Geometry, Dftb1, Dftb2
 torch.set_printoptions(15)
 torch.set_default_dtype(torch.float64)
 
@@ -18,8 +16,13 @@ def test_h2o(device):
     geometry = Geometry.from_ase_atoms([molecule('H2O')], device=device)
     path_to_skf = './tests/unittests/data/slko/mio'
 
+    dftb1 = Dftb1(geometry, shell_dict=shell_dict,
+                  path_to_skf=path_to_skf, skf_type='skf')
     dftb2 = Dftb2(geometry, shell_dict=shell_dict,
                   path_to_skf=path_to_skf, skf_type='skf')
+
+    assert torch.max(abs(dftb1.charge - torch.tensor([
+        6.760316843429, 0.619841578285, 0.619841578285]))) < 1E-10
     assert torch.max(abs(dftb2.charge - torch.tensor([
         6.587580500853424, 0.706209749573288, 0.706209749573288]))) < 1E-10
 
@@ -62,7 +65,6 @@ def test_h2o_var(device):
                   interpolation='BicubInterp', grids=grids, multi_varible=compr)
     assert torch.max(abs(dftb2.charge - torch.tensor([
         6.588870121994031, 0.705564939002985, 0.705564939002985]))) < 5E-3
-
 
     # 2.1 Test basis with two variable: density compression radii and
     # wavefunction compression radii, both are set the same here
@@ -109,7 +111,6 @@ def test_batch(device):
     dftb2 = Dftb2(geometry, shell_dict=shell_dict,
                   path_to_skf=path_to_skf, skf_type='skf')
     assert torch.max(abs(dftb2.charge - ref1)) < 1E-10
-
 
     geometry = Geometry.from_ase_atoms([
         molecule('CH4'), molecule('H2O'), molecule('C2H6')])
