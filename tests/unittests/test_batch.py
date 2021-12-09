@@ -3,7 +3,7 @@ import torch
 from torch.autograd import gradcheck
 import pytest
 import numpy as np
-from tbmalt.common.batch import pack, unpack, merge, deflate, psort, pargsort
+from tbmalt.common.batch import pack, unpack, merge, deflate, psort
 from tests.test_utils import fix_seed
 
 

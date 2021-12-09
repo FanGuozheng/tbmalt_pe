@@ -719,20 +719,28 @@ class VcrSkf(Skf):
             _homo = super().read(path_homo, atom_pair, **kwargs)
             for ih in ['mass', 'occupations', 'on_sites', 'hubbard_us']:
                 kwargs_in[ih] = getattr(_homo, ih)
-
-
-        if _iskf[-1].r_spline is not None:
-            r_grid = pack([ii.r_spline.grid for ii in _iskf])
-            r_cutoff = pack([ii.r_spline.cutoff.unsqueeze(0) for ii in _iskf])
-            r_spline_coef = pack([ii.r_spline.spline_coef for ii in _iskf])
-            r_exp_coef = pack([ii.r_spline.exp_coef for ii in _iskf])
-            r_tail_coef = pack([ii.r_spline.tail_coef for ii in _iskf])
-
+            r_grid =_homo.r_spline.grid
+            r_cutoff = _homo.r_spline.cutoff
+            r_spline_coef = _homo.r_spline.spline_coef
+            r_exp_coef = _homo.r_spline.exp_coef
+            r_tail_coef = _homo.r_spline.tail_coef
             kwargs_in['r_spline'] = cls.RSpline(
                 # Repulsive grid, cutoff & repulsive spline coefficients.
                 r_grid, r_cutoff, r_spline_coef,
                 # The exponential and tail spline's coefficients.
                 r_exp_coef, r_tail_coef)
+
+        # if _iskf[-1].r_spline is not None:
+        #     r_grid = pack([ii.r_spline.grid for ii in _iskf])
+        #     r_cutoff = pack([ii.r_spline.cutoff.unsqueeze(0) for ii in _iskf])
+        #     r_spline_coef = pack([ii.r_spline.spline_coef for ii in _iskf])
+        #     r_exp_coef = pack([ii.r_spline.exp_coef for ii in _iskf])
+        #     r_tail_coef = pack([ii.r_spline.tail_coef for ii in _iskf])
+        #     kwargs_in['r_spline'] = cls.RSpline(
+        #         # Repulsive grid, cutoff & repulsive spline coefficients.
+        #         r_grid, r_cutoff, r_spline_coef,
+        #         # The exponential and tail spline's coefficients.
+        #         r_exp_coef, r_tail_coef)
 
         return cls(atom_pair, h_data, s_data, grid, hs_cut, **kwargs_in)
 

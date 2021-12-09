@@ -88,6 +88,13 @@ _alpha_fs = 0.007297352568
 _au__fs = 0.02418884326505
 # Debye -> Atomic units [dipole]
 _Debye__au = 1.0e-16 * _alpha_fs * _au__fs * _Coulomb__au * _AA__Bohr**2
+# atomic mass -> Atomic units [mass]
+_mass__as = 0.00054857990945
+# Conversion factors for energy units
+
+time_units: Dict[str, float] = {
+    'femtoseconds': 1.0 / _au__fs,
+    'au': 1.0}
 
 # Conversion factors for energy units
 energy_units: Dict[str, float] = {
@@ -117,4 +124,8 @@ dipole_units: Dict[str, float] = {
     'debye': _Debye__au, 'd': _Debye__au,
     'ebohr': 1.0, 'eb': 1.0,
     'au': 1.0
+}
+
+mass_units: Dict[str, float] = {
+    'atomic': 1.0 / _mass__as, 'au': 1.0
 }

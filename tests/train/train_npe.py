@@ -10,7 +10,7 @@ from ase.build import molecule
 from tbmalt.structures.geometry import Geometry
 from tbmalt.ml.optim import OptHs, OptVcr, OptTvcr
 from tbmalt.common.parameter import params
-from tbmalt.io.referencedataset import LoadHdf
+from tbmalt.io.hdf import LoadHdf
 from tbmalt.physics.dftb.dftb import Dftb2
 from tbmalt.ml.skfeeds import SkfFeed
 from tbmalt.structures.basis import Basis
@@ -22,7 +22,7 @@ torch.set_default_dtype(torch.float64)
 ###########
 # general #
 ###########
-target = 'optimize_pe'
+target = 'optimize'
 device = torch.device('cpu')
 
 ###################
@@ -113,77 +113,6 @@ def optimize(dataset_ref, size, dataset_dftb=None, **kwargs):
         _plot(data_ref[target], getattr(dftb, target), data_dftb[target], target)
 
 
-def optimize_pe(dataset_ref, size, dataset_dftb=None, **kwargs):
-    """Optimize spline parameters or compression radii."""
-    params['ml']['lr'] = 0.001 if params['ml']['task'] == 'mlIntegral' else 0.01
-    cell = torch.eye(3).repeat(size, 1, 1) * 6
-    params['dftb']['dftb2']['maxiter'] = 1
-    kpoints = torch.tensor([2, 2, 2]).repeat(size, 1)
-    klines = torch.tensor([[0.5, 0.5, -0.5, 1], [0.0, 0.0, 0.0, 4],
-                          [0.0, 0.0, 1.0, 4]]).repeat(size, 1, 1)
-
-    geo_opt, data_ref = _load_ref(dataset_ref, size, [
-        'charge', 'dipole', 'hirshfeld_volume_ratio'], cell=cell)
-
-
-    # h2 = molecule('H2')
-    # numbers = torch.from_numpy(h2.numbers).repeat(size, 1)
-    # positions = torch.from_numpy(h2.positions).repeat(size, 1, 1)
-    # geo_opt = Geometry(numbers, positions, cell=cell)
-    # data_ref = {'charge': torch.ones(numbers.shape),
-    #             'hirshfeld_volume_ratio': torch.ones(numbers.shape)}
-
-
-    data_ref['cpa'] = data_ref['hirshfeld_volume_ratio']
-    # if dataset_dftb is not None:
-    #     geo_dftb, data_dftb = _load_ref(
-    #         dataset_dftb, size, ['charge', 'dipole'], cell=cell)
-
-    # optimize integrals with spline parameters
-    if params['ml']['task'] == 'mlIntegral':
-        params['dftb']['path_to_skf'] = './slko/mio_new.hdf'
-        opt = OptHs(geo_opt, data_ref, params, shell_dict, kpoints=kpoints)
-        dftb = opt(break_tolerance=break_tolerance)
-
-        # save training instance
-        with open('opt_int.pkl', "wb") as f:
-            pickle.dump(opt, f)
-
-    # optimize integrals with compression radii
-    elif params['ml']['task'] == 'vcr':
-        params['dftb']['path_to_skf'] = './vcr.h5'
-        params['dftb']['path_to_skf2'] = '../../slko/mio-1-1/'
-        opt = OptVcr(geo_opt, data_ref, params, vcr, shell_dict,
-                     h_compr_feed=h_compr_feed, s_compr_feed=s_compr_feed,
-                     interpolation='BicubInterp', global_r=global_r, kpoints=kpoints)
-        dftb = opt(break_tolerance=break_tolerance)
-
-        # save training instance
-        with open('opt_compr.pkl', "wb") as f:
-            pickle.dump(opt, f)
-
-    # optimize integrals with compression radii
-    elif params['ml']['task'] == 'tvcr':
-        params['dftb']['path_to_skf'] = './tvcr.h5'
-        opt = OptTvcr(geo_opt, data_ref, params, tvcr, shell_dict,
-                     h_compr_feed=h_compr_feed, s_compr_feed=s_compr_feed,
-                     interpolation='BSpline', global_r=global_r)
-        dftb = opt(break_tolerance=break_tolerance)
-        print('compr', opt.compr)
-
-        # save training instance
-        with open('opt_compr.pkl', "wb") as f:
-            pickle.dump(opt, f)
-
-    if 'cpa' in params['ml']['targets']:
-        dftb_mio = _cal_cpa(geo_opt, params, path='../unittests/slko/mio-1-1/')
-        _plot(data_ref['cpa'], dftb.cpa, dftb_mio.cpa, 'cpa')
-
-    params['ml']['targets'] = ['charge', 'dipole']
-    for target in params['ml']['targets']:
-        _plot(data_ref[target], getattr(dftb, target), data_dftb[target], target)
-
-
 def predict(pickle_file: str, dataset: str, size: int, **kwargs):
     """Test optimized results."""
     device = kwargs.get('device', torch.device('cpu'))
@@ -246,7 +175,5 @@ if __name__ == '__main__':
     """Main function."""
     if target == 'optimize':
         optimize(dataset_aims, size_opt, dataset_dftb, device=device)
-    if target == 'optimize_pe':
-        optimize_pe(dataset_aims, size_opt, dataset_dftb, device=device)
     elif target == 'predict':
         predict(pickle_file, dataset_pred, size_pred, device=device)

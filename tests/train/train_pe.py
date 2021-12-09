@@ -8,7 +8,7 @@ import torch
 from tbmalt.structures.geometry import Geometry
 from tbmalt.ml.optim import OptHs, OptVcr, OptTvcr
 from tbmalt.common.parameter import params
-from tbmalt.io.referencedataset import LoadHdf
+from tbmalt.io.hdf import LoadHdf
 from tbmalt.physics.dftb.dftb import Dftb2
 from tbmalt.ml.skfeeds import SkfFeed
 from tbmalt.structures.basis import Basis
@@ -64,11 +64,6 @@ def optimize(dataset_ref, size, dataset_dftb=None, **kwargs):
         dataset_ref, size, ['charge', 'dipole', 'hirshfeld_volume_ratio'],
         cell=(torch.eye(3)*6).repeat(size, 1, 1))
     data_ref['cpa'] = data_ref['hirshfeld_volume_ratio']
-
-    # to complex number
-    data_ref['charge'] = data_ref['charge'] + torch.zeros(
-        data_ref['charge'].shape, dtype=torch.complex64)
-
 
     if dataset_dftb is not None:
         geo_dftb, data_dftb = _load_ref(dataset_dftb, size, ['charge', 'dipole'])

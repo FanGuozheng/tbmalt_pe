@@ -438,8 +438,8 @@ def eighb(a: Tensor,
 
     Keyword Args:
         direct_inv (bool): If True then the matrix inversion will be computed
-            directly rather than via a call to torch.solve. Only relevant to
-            the cholesky scheme. [DEFAULT=False]
+            directly rather than via a call to torch.linalg..solve. Only
+            relevant to the cholesky scheme. [DEFAULT=False]
 
     Returns:
         w: The eigenvalues, in ascending order.
@@ -560,7 +560,7 @@ def eighb(a: Tensor,
         if scheme == 'chol':
 
             # Perform Cholesky factorization (A = LL^{T}) of B to attain L
-            l = torch.cholesky(b)
+            l = torch.linalg.cholesky(b)
 
             # Compute the inverse of L:
             if kwargs.get('direct_inv', False):
@@ -568,8 +568,10 @@ def eighb(a: Tensor,
                 l_inv = torch.inverse(l)
             else:
                 # Otherwise compute via an indirect method (default)
-                l_inv = torch.solve(torch.eye(a.shape[-1], dtype=a.dtype,
-                                              device=b.device), l)[0]
+                # l_inv = torch.solve(torch.eye(a.shape[-1], dtype=a.dtype,
+                #                               device=b.device), l)[0]
+                l_inv = torch.linalg.solve(
+                    l, torch.eye(a.shape[-1], dtype=a.dtype, device=b.device))
             # Transpose of l_inv: improves speed in batch mode
             l_inv_t = torch.transpose(l_inv, -1, -2)
 

@@ -73,7 +73,7 @@ class Geometry:
 
     """
 
-    __slots__ = ['atomic_numbers', 'positions', 'n_atoms',
+    __slots__ = ['atomic_numbers', 'positions', 'n_atoms', 'updated_dist_vec',
                  'cell', 'isperiodic', 'periodic_list', 'frac_list', 'pbc',
                  '_n_batch', '_mask_dist', '__dtype', '__device']
 
@@ -81,11 +81,12 @@ class Geometry:
                  positions: Union[Tensor, List[Tensor]],
                  cell: Union[Tensor, List[Tensor]] = None,
                  frac: Union[float, List[float]] = None,
-                 units: Optional[str] = 'bohr'):
+                 units: Optional[str] = 'bohr', **kwargs):
 
         # "pack" will only effect lists of tensors
         self.atomic_numbers: Tensor = pack(atomic_numbers)
         self.positions: Tensor = pack(positions)
+        self.updated_dist_vec = kwargs.get('updated_dist_vec', None)
 
         # bool tensor isperiodic defines if there is solid
         if cell is None:
@@ -149,17 +150,23 @@ class Geometry:
     @property
     def distances(self) -> Tensor:
         """Distance matrix between atoms in the system."""
-        dist = torch.cdist(self.positions, self.positions, p=2)
-        # Ensure padding area is zeroed out
-        dist[self._mask_dist] = 0
-        return dist
+        if self.updated_dist_vec is None:
+            dist = torch.cdist(self.positions, self.positions, p=2)
+            # Ensure padding area is zeroed out
+            dist[self._mask_dist] = 0
+            return dist
+        else:
+            return torch.sqrt((self.updated_dist_vec ** 2).sum(-1))
 
     @property
     def distance_vectors(self) -> Tensor:
         """Distance vector matrix between atoms in the system."""
-        dist_vec = self.positions.unsqueeze(-2) - self.positions.unsqueeze(-3)
-        dist_vec[self._mask_dist] = 0
-        return dist_vec
+        if self.updated_dist_vec is None:
+            dist_vec = self.positions.unsqueeze(-2) - self.positions.unsqueeze(-3)
+            dist_vec[self._mask_dist] = 0
+            return dist_vec
+        else:
+            return self.updated_dist_vec
 
     @property
     def chemical_symbols(self) -> list:

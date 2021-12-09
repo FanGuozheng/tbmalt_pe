@@ -6,10 +6,7 @@ from sklearn.neural_network import MLPRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.kernel_ridge import KernelRidge
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-# from sklearn import preprocessing
 from tbmalt.common.batch import pack
-ATOMNUM = {'H': 1, 'C': 6, 'N': 7, 'O': 8}
-_val = [1, 2, 1, 2, 3, 4, 5, 6]
 
 
 class SciKitLearn:

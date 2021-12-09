@@ -18,7 +18,16 @@ Tensor = torch.Tensor
 
 
 class Optim:
-    """Optimizer."""
+    """Optimizer template for DFTB parameters training.
+
+    Arguments:
+        geometry: TBMaLT geometry object.
+        reference: A dictionary for reference data.
+        variables: A list of variables with gradients.
+        params: Dictionary which stores ML parameters.
+        tolerance: Accuracy for machine learning loss convergence.
+
+    """
 
     def __init__(self, geometry: Geometry, reference: dict, variables: list,
                  params: dict, tolerance: float = 1E-7, **kwargs):
@@ -156,10 +165,9 @@ class OptHs(Optim):
         else:
             ham = hs_matrix(self.geometry, self.basis, self.h_feed)
             over = hs_matrix(self.geometry, self.basis, self.s_feed)
-        self.dftb = Dftb2(self.params, self.geometry, self.shell_dict,
-                          self.params['dftb']['path_to_skf'],
-                          ham=ham, over=over, from_skf=True)
-        # self.dftb()
+        self.dftb = Dftb2(self.geometry, self.shell_dict,
+                          self.params['dftb']['path_to_skf'], from_skf=True)
+        self.dftb(hamiltonian=ham, overlap=over)
         super().__loss__(self.dftb)
         self.optimizer.zero_grad()
         self.loss.backward(retain_graph=True)
@@ -277,10 +285,8 @@ class OptVcr(Optim):
 
         self.ham_list.append(ham.detach()), self.over_list.append(over.detach())
         self.dftb = Dftb2(self.geometry, self.shell_dict,
-                          self.params['dftb']['path_to_skf'],
-                          hamiltonian=ham, overlap=over, from_skf=True,
-                          periodic=self.periodic)
-        # self.dftb()
+                          self.params['dftb']['path_to_skf'])
+        self.dftb(hamiltonian=ham, overlap=over)
         super().__loss__(self.dftb)
         self._compr.append(self.compr.detach().clone())
         self.optimizer.zero_grad()

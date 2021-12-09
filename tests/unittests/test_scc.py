@@ -1,9 +1,10 @@
 """Test SCC DFTB."""
 import torch
+import os
 import pytest
 from torch.autograd import gradcheck
 from ase.build import molecule
-from tbmalt import Geometry, Dftb1, Dftb2
+from tbmalt import Geometry, Basis, SkfFeed, Dftb1, Dftb2
 torch.set_printoptions(15)
 torch.set_default_dtype(torch.float64)
 
@@ -16,13 +17,9 @@ def test_h2o(device):
     geometry = Geometry.from_ase_atoms([molecule('H2O')], device=device)
     path_to_skf = './tests/unittests/data/slko/mio'
 
-    dftb1 = Dftb1(geometry, shell_dict=shell_dict,
-                  path_to_skf=path_to_skf, skf_type='skf')
     dftb2 = Dftb2(geometry, shell_dict=shell_dict,
                   path_to_skf=path_to_skf, skf_type='skf')
-
-    assert torch.max(abs(dftb1.charge - torch.tensor([
-        6.760316843429, 0.619841578285, 0.619841578285]))) < 1E-10
+    dftb2()
     assert torch.max(abs(dftb2.charge - torch.tensor([
         6.587580500853424, 0.706209749573288, 0.706209749573288]))) < 1E-10
 
@@ -31,6 +28,7 @@ def test_h2o(device):
 
     dftb2 = Dftb2(geometry, shell_dict=shell_dict,
                   path_to_skf=path_to_skf, skf_type='h5')
+    dftb2()
     assert torch.max(abs(dftb2.charge - torch.tensor([
         6.587580500853424, 0.706209749573288, 0.706209749573288]))) < 1E-10
 
@@ -47,6 +45,7 @@ def test_h2o_var(device):
     dftb2 = Dftb2(geometry, shell_dict=shell_dict,
                   path_to_skf=path_to_skf, skf_type='h5', basis_type='vcr',
                   interpolation='BicubInterp', grids=grids, multi_varible=compr)
+    dftb2()
     assert torch.max(abs(dftb2.charge - torch.tensor([
         6.622131504505886, 0.688934247747058, 0.688934247747058]))) < 1E-5
 
@@ -55,6 +54,7 @@ def test_h2o_var(device):
     dftb2 = Dftb2(geometry, shell_dict=shell_dict,
                   path_to_skf=path_to_skf, skf_type='h5', basis_type='vcr',
                   interpolation='BicubInterp', grids=grids, multi_varible=compr)
+    dftb2()
     assert torch.max(abs(dftb2.charge - torch.tensor([
         6.587862806962196, 0.706068596518902, 0.706068596518902]))) < 1E-3
 
@@ -63,8 +63,10 @@ def test_h2o_var(device):
     dftb2 = Dftb2(geometry, shell_dict=shell_dict,
                   path_to_skf=path_to_skf, skf_type='h5', basis_type='vcr',
                   interpolation='BicubInterp', grids=grids, multi_varible=compr)
+    dftb2()
     assert torch.max(abs(dftb2.charge - torch.tensor([
         6.588870121994031, 0.705564939002985, 0.705564939002985]))) < 5E-3
+
 
     # 2.1 Test basis with two variable: density compression radii and
     # wavefunction compression radii, both are set the same here
@@ -74,6 +76,7 @@ def test_h2o_var(device):
     dftb2 = Dftb2(geometry, shell_dict=shell_dict,
                   path_to_skf=path_to_skf, skf_type='h5', basis_type='tvcr',
                   interpolation='BSpline', grids=grids, multi_varible=compr)
+    dftb2()
     assert torch.max(abs(dftb2.charge - torch.tensor([
         6.662066383899750, 0.668966808050125, 0.668966808050125]))) < 1E-4
     # 2.2 set all compression radii as 2.75
@@ -81,6 +84,7 @@ def test_h2o_var(device):
     dftb2 = Dftb2(geometry, shell_dict=shell_dict,
                   path_to_skf=path_to_skf, skf_type='h5', basis_type='tvcr',
                   interpolation='BSpline', grids=grids, multi_varible=compr)
+    dftb2()
     assert torch.max(abs(dftb2.charge - torch.tensor([
         6.659845691910212, 0.670077154044895, 0.670077154044895]))) < 1E-4
 
@@ -89,6 +93,7 @@ def test_h2o_var(device):
     dftb2 = Dftb2(geometry, shell_dict=shell_dict,
                   path_to_skf=path_to_skf, skf_type='h5', basis_type='tvcr',
                   interpolation='BSpline', grids=grids, multi_varible=compr)
+    dftb2()
     assert(abs(dftb2.charge - torch.tensor([
         6.588870121994031, 0.705564939002985, 0.705564939002985]))) < 5E-3
 
@@ -110,20 +115,18 @@ def test_batch(device):
     path_to_skf = './tests/unittests/data/slko/mio'
     dftb2 = Dftb2(geometry, shell_dict=shell_dict,
                   path_to_skf=path_to_skf, skf_type='skf')
+    dftb2()
     assert torch.max(abs(dftb2.charge - ref1)) < 1E-10
 
     geometry = Geometry.from_ase_atoms([
         molecule('CH4'), molecule('H2O'), molecule('C2H6')])
 
-    # 1.1 Perfrom DFTB calculations with standard SKF input
-    path_to_skf = './tests/unittests/data/slko/mio'
-    dftb2 = Dftb2(geometry, shell_dict=shell_dict,
-                  path_to_skf=path_to_skf, skf_type='skf')
-
     # 2. Perfrom DFTB calculations with h5 SK input
     path_to_skf = './tests/unittests/data/slko/mio.hdf'
     dftb2 = Dftb2(geometry, shell_dict=shell_dict,
                   path_to_skf=path_to_skf, skf_type='h5')
+    dftb2()
+
     assert torch.max(abs(dftb2.charge - ref1)) < 1E-10
 
 
@@ -140,6 +143,7 @@ def test_batch_vcr(device):
     dftb2 = Dftb2(geometry, shell_dict=shell_dict,
                   path_to_skf=path_to_skf, skf_type='h5', basis_type='tvcr',
                   interpolation='BSpline', grids=grids, multi_varible=compr)
+    dftb2()
     assert torch.max(abs(dftb2.charge - torch.tensor([
         [4.411561510172980, 0.897109622456755, 0.897109622456755,
          0.897109622456755, 0.897109622456755, 0., 0., 0.],
@@ -162,6 +166,7 @@ def test_batch_vcr(device):
     dftb2 = Dftb2(geometry, shell_dict=shell_dict,
                   path_to_skf=path_to_skf, skf_type='h5', basis_type='tvcr',
                   interpolation='BSpline', grids=grids, multi_varible=compr)
+    dftb2()
     assert torch.max(abs(dftb2.charge - torch.tensor([
             [4.305378934388628, 0.923655266402844, 0.923655266402843,
              0.923655266402843, 0.923655266402844, 0., 0., 0.],

@@ -17,3 +17,18 @@ namespace, e.g.
     from tbmalt.structures.geometry import Geometry
 
 """
+import torch
+from torch import Tensor
+from tbmalt.common.batch import pack
+
+
+def orbs_to_atom(intensor: Tensor, orbs_per_atom: Tensor) -> Tensor:
+    """Transform orbital resolved tensor to atom resolved tensor."""
+    # get a list of accumulative orbital indices
+    ind_cumsum = [torch.cat((
+        torch.zeros(1), torch.cumsum(ii[ii.ne(0)], -1))).long()
+        for ii in orbs_per_atom]
+
+    # return charge of each atom for batch system
+    return pack([torch.stack([(it[..., ii: jj]).sum(-1) for ii, jj in zip(
+        ic[:-1], ic[1:])]) for ic, it in zip(ind_cumsum, intensor)])
