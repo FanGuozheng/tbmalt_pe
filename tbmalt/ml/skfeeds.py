@@ -1104,8 +1104,8 @@ def _get_dict(sk_dict: dict, skf: Skf) -> Tuple[dict, dict]:
 
     """
     sk_dict[(*skf.atom_pair.tolist(), 'grid')] = skf.r_spline.grid
-    # sk_dict[(*skf.atom_pair.tolist(), 'long_grid')] = torch.stack(
-    #     [skf.r_spline.grid[-1], skf.r_spline.cutoff])
+    sk_dict[(*skf.atom_pair.tolist(), 'long_grid')] = torch.stack(
+        [skf.r_spline.grid[-1], skf.r_spline.cutoff])
     sk_dict[(*skf.atom_pair.tolist(), 'rep_cut')] = skf.r_spline.cutoff
     sk_dict[(*skf.atom_pair.tolist(), 'spline_coef')] = skf.r_spline.spline_coef
     sk_dict[(*skf.atom_pair.tolist(), 'exp_coef')] = skf.r_spline.exp_coef

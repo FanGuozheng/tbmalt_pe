@@ -187,8 +187,8 @@ class Periodic:
         _latvec = self.latvec + torch.diag_embed(mask_zero.type(self.latvec.dtype))
 
         # inverse lattice vectors
-        _invlat = torch.transpose(torch.solve(torch.eye(
-            _latvec.shape[-1]), _latvec)[0], -1, -2)
+        _invlat = torch.transpose(torch.linalg.solve(
+            _latvec, torch.eye(_latvec.shape[-1])), -1, -2)
         _invlat[mask_zero] = 0
         return _invlat, mask_zero
 

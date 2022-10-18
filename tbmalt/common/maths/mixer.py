@@ -247,7 +247,7 @@ class Anderson(_Mixer):
                 aa = aa * (1 + torch.eye(aa.shape[-1]) * self.gamma ** 2)
 
             # Solve for the coefficients, use mask to avoid singular U error
-            thetas = torch.solve(bb, aa)[0].squeeze(-1)
+            thetas = torch.linalg.solve(aa, bb).squeeze(-1)
             q_bar = (thetas * self._dQ[1: previous_step, self.mask].transpose(
                 2, 0)).transpose(2, 0).sum(0)
             F_bar = (thetas * self._F[1: previous_step, self.mask].transpose(
