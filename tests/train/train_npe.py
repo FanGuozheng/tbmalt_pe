@@ -28,7 +28,7 @@ device = torch.device('cpu')
 ###################
 # optimize params #
 ###################
-size_opt = 30
+size_opt = 100
 params['ml']['task'] = 'vcr'
 params['ml']['compression_radii_min'] = 2.0
 params['ml']['compression_radii_max'] = 9.0

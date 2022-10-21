@@ -152,7 +152,6 @@ def hs_matrix(geometry: Geometry, basis: Basis, sk_feed: SkFeed,
         integrals = _gather_off_site(g_anum, shell_pairs, g_dist, sk_feed,
                                      isperiodic, g_var, **kwargs,
                                      atom_indices=index_mask_a)
-
         # Make a call to the relevant Slater-Koster function to get the sk-block
         sk_data = sub_block_rot(l_pair, g_vecs, integrals)
 
