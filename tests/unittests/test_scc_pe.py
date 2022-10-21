@@ -4,7 +4,7 @@ import pytest
 import numpy as np
 from ase.build import molecule
 from tbmalt import Geometry, Dftb1, Dftb2
-from tbmalt.io import read_band
+from tbmalt.utils.gen.band import read_band
 
 torch.set_default_dtype(torch.float64)
 shell_dict = {1: [0], 6: [0, 1], 7: [0, 1], 8: [0, 1],
@@ -84,6 +84,29 @@ def test_ch4_pe(device):
          0.923631234483662, 0.923631234483662]]))) < 1E-9
 
 
+def test_batch_pe(device):
+    """Test SCC DFTB for ch4 with periodic boundary condition."""
+    ch4 = molecule('CH4')
+    ch4.cell = [6.0, 6.0, 6.0]
+    h2o = molecule('H2O')
+    h2o.cell = [6.0, 6.0, 6.0]
+
+    kpoints = torch.tensor([[1, 1, 1], [1, 1, 1]])
+    geometry = Geometry.from_ase_atoms([ch4, h2o])
+    path_to_skf = './tests/unittests/data/slko/mio'
+
+    dftb2 = Dftb2(geometry, shell_dict=shell_dict, path_to_skf=path_to_skf,
+                  skf_type='skf', kpoints=kpoints)
+    dftb2()
+
+    assert torch.max(abs(dftb2.charge[0] - torch.tensor([[
+        4.305475062065351, 0.923631234483662, 0.923631234483662,
+         0.923631234483662, 0.923631234483662]]))) < 1E-9
+
+    assert torch.max(abs(dftb2.charge[1, :3] - torch.tensor(
+        [[6.59150660, 0.70424670, 0.70424670]]))) < 5E-9
+
+
 def test_c2h6_pe(device):
     """Test SCC DFTB for ch4 with periodic boundary condition."""
     ch4 = molecule('C2H6')
@@ -101,8 +124,8 @@ def test_c2h6_pe(device):
 
 def test_si_pe(device):
     """Test SCC DFTB for c2h6 with periodic boundary condition."""
-    hr_pe5 = _get_matrix('./tests/unittests/data/sk/si/hamsqr1.dat.pe5', device)
-    sr_pe5 = _get_matrix('./tests/unittests/data/sk/si/oversqr.dat.pe5', device)
+    # hr_pe5 = _get_matrix('./tests/unittests/data/sk/si/hamsqr1.dat.pe5', device)
+    # sr_pe5 = _get_matrix('./tests/unittests/data/sk/si/oversqr.dat.pe5', device)
     band = read_band('./tests/unittests/data/sk/si/band.out')
     bandd = read_band('./tests/unittests/data/sk/si/band.out.d')
 
@@ -113,8 +136,10 @@ def test_si_pe(device):
             [2.713546, 2.713546, 0.0], [0.0, 2.713546, 2.713546],
             [2.713546, 0.0, 2.713546]]]),
         units='angstrom')
-    klines = torch.tensor([[0.5, 0.5, -0.5, 0], [0, 0, 0, 11],
-                           [0, 0, 0.5, 11], [0.25, 0.25, 0.25, 11]])
+
+    klines = torch.tensor([[0.5, 0.5, -0.5, 0, 0, 0, 11],
+                           [0, 0, 0, 0, 0, 0.5, 11],
+                           [0, 0, 0.5, 0.25, 0.25, 0.25, 11]])
     path_to_skf = './tests/unittests/data/slko'
     dftb2 = Dftb2(geometry, shell_dict=shell_dict,
                   path_to_skf=path_to_skf, skf_type='skf', klines=klines)
@@ -133,6 +158,8 @@ def test_si_pe(device):
     assert check_band
     assert check_bandd
 
+
+# test_si_pe(torch.device('cpu'))
 
 def _get_matrix(filename, device):
     """Read DFTB+ hamsqr1.dat and oversqr.dat."""

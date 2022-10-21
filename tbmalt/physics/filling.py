@@ -14,30 +14,34 @@ from tbmalt.common.batch import psort
 _Scheme = Callable[[Tensor, Tensor, float_like], Tensor]
 
 
-def fermi_entropy(eigenvalues: Tensor, fermi_energy: Tensor, kT: float_like,
-                  e_mask: Optional[Union[Tensor, Basis]] = None) -> Tensor:
+def fermi_entropy(
+    eigenvalues: Tensor,
+    fermi_energy: Tensor,
+    kT: float_like,
+    e_mask: Optional[Union[Tensor, Basis]] = None,
+) -> Tensor:
     r"""Calculates the electronic entropy term for Fermi-Dirac smearing.
 
-        Calculate a system's electronic entropy term. The entropy term is required
-        when calculating various properties, most notably the Mermin free energy;
-        which is used in place of the total system energy when finite temperature
-        (electronic broadening) is active.
+    Calculate a system's electronic entropy term. The entropy term is required
+    when calculating various properties, most notably the Mermin free energy;
+    which is used in place of the total system energy when finite temperature
+    (electronic broadening) is active.
 
-        .. math::
+    .. math::
 
-            TS = -k_B\sum_{i}f_i \; ln(f_i) + (1 - f_i)\; ln(1 - f_i))
+        TS = -k_B\sum_{i}f_i \; ln(f_i) + (1 - f_i)\; ln(1 - f_i))
 
-        Arguments:
-            eigenvalues: Eigen-energies, i.e. orbital-energies.
-            fermi_energy: The Fermi energy.
-            kT: Electronic temperature.
-            e_mask: Padding mask see :func:`fermi_search` for more information.
-                [DEFAULT=None]
+    Arguments:
+        eigenvalues: Eigen-energies, i.e. orbital-energies.
+        fermi_energy: The Fermi energy.
+        kT: Electronic temperature.
+        e_mask: Padding mask see :func:`fermi_search` for more information.
+            [DEFAULT=None]
 
-        Returns:
-            ts: The entropy term(s).
+    Returns:
+        ts: The entropy term(s).
 
-        """
+    """
     # If a Basis instance was given as a mask then convert it to a tensor
     if isinstance(e_mask, Basis):
         e_mask = e_mask.on_atoms != -1
@@ -52,7 +56,7 @@ def fermi_entropy(eigenvalues: Tensor, fermi_energy: Tensor, kT: float_like,
     # Get fractional orbital occupancies
     fo = fermi_smearing(eigenvalues, fermi_energy, kT)
     # Log form is used as it avoids having to cull error inducing 1's/0's
-    s = -torch.log(fo ** fo * (1 - fo) ** (1 - fo))
+    s = -torch.log(fo**fo * (1 - fo) ** (1 - fo))
 
     if e_mask is not None:  # Mask out *fake* padding states as appropriate
         # pylint: disable=E1130
@@ -61,26 +65,30 @@ def fermi_entropy(eigenvalues: Tensor, fermi_energy: Tensor, kT: float_like,
     return s.sum(-1) * kT
 
 
-def gaussian_entropy(eigenvalues: Tensor, fermi_energy: Tensor, kT: float_like,
-                     e_mask: Optional[Union[Tensor, Basis]] = None) -> Tensor:
+def gaussian_entropy(
+    eigenvalues: Tensor,
+    fermi_energy: Tensor,
+    kT: float_like,
+    e_mask: Optional[Union[Tensor, Basis]] = None,
+) -> Tensor:
     r"""Calculates the electronic entropy term for Gaussian bases smearing.
 
-        .. math::
+    .. math::
 
-            TS = \frac{k_B}{2 \sqrt{\pi}} \sum_{i} exp \left(- \left(
-                    \frac{\epsilon_i E_f}{kT} \right)^2 \right)
+        TS = \frac{k_B}{2 \sqrt{\pi}} \sum_{i} exp \left(- \left(
+                \frac{\epsilon_i E_f}{kT} \right)^2 \right)
 
-        Arguments:
-            eigenvalues: Eigen-energies, i.e. orbital-energies.
-            fermi_energy: The Fermi energy.
-            kT: Electronic temperature.
-            e_mask: Padding mask see :func:`fermi_search` for more information.
-                [DEFAULT=None]
+    Arguments:
+        eigenvalues: Eigen-energies, i.e. orbital-energies.
+        fermi_energy: The Fermi energy.
+        kT: Electronic temperature.
+        e_mask: Padding mask see :func:`fermi_search` for more information.
+            [DEFAULT=None]
 
-        Returns:
-            ts: The entropy term(s).
+    Returns:
+        ts: The entropy term(s).
 
-        """
+    """
     # If a Basis instance was given as a mask then convert it to a tensor
     if isinstance(e_mask, Basis):
         e_mask = e_mask.on_atoms != -1
@@ -97,7 +105,7 @@ def gaussian_entropy(eigenvalues: Tensor, fermi_energy: Tensor, kT: float_like,
 
     # Calculate xi values then return the entropy
     xi = (eigenvalues - fermi_energy) / kT
-    s = torch.exp(-xi ** 2) * 0.5 / sqrt(pi)
+    s = torch.exp(-(xi**2)) * 0.5 / sqrt(pi)
 
     if e_mask is not None:  # Mask out *fake* padding states as appropriate
         # pylint: disable=E1130
@@ -111,8 +119,8 @@ def gaussian_entropy(eigenvalues: Tensor, fermi_energy: Tensor, kT: float_like,
 
 
 def _smearing_preprocessing(
-        eigenvalues: Tensor, fermi_energy: Tensor, kT: float_like
-        ) -> Tuple[Tensor, Tensor]:
+    eigenvalues: Tensor, fermi_energy: Tensor, kT: float_like
+) -> Tuple[Tensor, Tensor]:
     """Abstracts repetitive code from the smearing functions.
 
     Arguments:
@@ -126,8 +134,8 @@ def _smearing_preprocessing(
 
     """
     # These must be tensors for code to be batch agnostic & device safe
-    assert isinstance(eigenvalues, Tensor), 'eigenvalues must be a tensor'
-    assert isinstance(fermi_energy, Tensor), 'fermi_energy must be a tensor'
+    assert isinstance(eigenvalues, Tensor), "eigenvalues must be a tensor"
+    assert isinstance(fermi_energy, Tensor), "fermi_energy must be a tensor"
 
     # Shape fermi_energy so that there is one entry per row (repeat for kT).
     if fermi_energy.ndim == 1 and len(fermi_energy) != 1:
@@ -136,8 +144,7 @@ def _smearing_preprocessing(
 
     # Ensure kT is a tensor & is shaped correctly if multiple values passed
     if not isinstance(kT, Tensor):
-        kT = torch.tensor(kT, dtype=eigenvalues.dtype,
-                          device=eigenvalues.device)
+        kT = torch.tensor(kT, dtype=eigenvalues.dtype, device=eigenvalues.device)
 
     if kT.ndim >= 1 and len(kT) != 1:
         kT = kT.view(-1, *[1] * (eigenvalues.ndim - 1))
@@ -148,8 +155,7 @@ def _smearing_preprocessing(
     return fermi_energy, kT
 
 
-def fermi_smearing(eigenvalues: Tensor, fermi_energy: Tensor, kT: float_like
-                   ) -> Tensor:
+def fermi_smearing(eigenvalues: Tensor, fermi_energy: Tensor, kT: float_like) -> Tensor:
     r"""Fractional orbital occupancies due to Fermi-Dirac smearing.
 
     Using Fermi-Dirac smearing, orbital occupancies are calculated via:
@@ -186,11 +192,15 @@ def fermi_smearing(eigenvalues: Tensor, fermi_energy: Tensor, kT: float_like
     # stability issue associated with this function.
     fermi_energy, kT = _smearing_preprocessing(eigenvalues, fermi_energy, kT)
     # Calculate and return the occupancies values via the Fermi-Dirac method
-    return 1.0 / (1.0 + torch.exp((eigenvalues - fermi_energy) / kT))
+    # return 1.0 / (1.0 + torch.exp((eigenvalues - fermi_energy) / kT))
+    vals = 1.0 / (1.0 + torch.exp((eigenvalues - fermi_energy) / kT))
+    vals[eigenvalues.eq(0)] = 0.0
+    return vals
 
 
-def gaussian_smearing(eigenvalues: Tensor, fermi_energy: Tensor,
-                      kT: float_like) -> Tensor:
+def gaussian_smearing(
+    eigenvalues: Tensor, fermi_energy: Tensor, kT: float_like
+) -> Tensor:
     r"""Fractional orbital occupancies due to Gaussian smearing.
 
     Using Gaussian smearing, orbital occupancies are calculated via:
@@ -230,11 +240,15 @@ def gaussian_smearing(eigenvalues: Tensor, fermi_energy: Tensor,
 
 @torch.no_grad()
 def fermi_search(
-        eigenvalues: Tensor, n_electrons: float_like,
-        kT: Optional[float_like] = None, scheme: _Scheme = fermi_smearing,
-        tolerance: Optional[Real] = None, max_iter: int = 200,
-        e_mask: Optional[Union[Tensor, Basis]] = None,
-        k_weights: Optional[Tensor] = None) -> Tensor:
+    eigenvalues: Tensor,
+    n_electrons: float_like,
+    kT: Optional[float_like] = None,
+    scheme: _Scheme = fermi_smearing,
+    tolerance: Optional[Real] = None,
+    max_iter: int = 200,
+    e_mask: Optional[Union[Tensor, Basis]] = None,
+    k_weights: Optional[Tensor] = None,
+) -> Tensor:
     r"""Determines the Fermi-energy of a system or batch thereof.
 
     Calculates the Fermi-energy with or without finite temperature. Finite
@@ -310,17 +324,19 @@ def fermi_search(
                density functional theory based atomistic simulations. The
                Journal of Chemical Physics, 152(12), 124101.
     """
-    def middle_gap_approximation():
+
+    def middle_gap_approximation(scale_factor):
         """Returns the midpoint between the HOMO and LUMO."""
         # Flatten & sort the eigenvalues so there's 1 row per-system; the
         # spin dimension is only flattened when the spin channels share a
         # common fermi-energy.
         ev_flat, srt = psort(
-            e_vals.view(shp),
-            None if e_mask is None else e_mask.view(shp))
+            e_vals.reshape(shp), None if e_mask is None else e_mask.view(shp)
+        )
 
+        scale_flat = scale_factor if k_weights is None else scale_factor.reshape(shp)
         # Maximum occupation of each eigenstate, sorted and flattened.
-        occ = (torch.ones_like(ev_flat) * scale_factor).gather(-1, srt)
+        occ = (torch.ones_like(ev_flat) * scale_flat).gather(-1, srt)
         # Locate HOMO index, via the transition between under/over filled
         i_homo = occ.cumsum(-1).T.le(n_elec).T.diff().nonzero().T[-1].view(shp)
         # Return the Fermi value
@@ -341,7 +357,11 @@ def fermi_search(
     # 2/1 for restricted/unrestricted molecular systems. For periodic systems
     # this is then multiplied by the k-point weights.
     pf = 5 - e_vals.ndim - [k_weights, e_mask].count(None)
-    scale_factor = pf if k_weights is None else pf * k_weights
+    scale_factor = (
+        pf
+        if k_weights is None
+        else pf * k_weights.repeat(1, e_vals.shape[-1]).reshape(e_vals.shape)
+    )
 
     # Shape of Ɛ tensor where k-points & spin-channels have been flattened out.
     # Note that only spin-channels with common fermi energies get flattened.
@@ -351,30 +371,40 @@ def fermi_search(
     if isinstance(e_mask, Basis):
         e_mask = e_mask.on_atoms != -1
 
+        # Add periodic conditions
+        if k_weights is not None:
+            e_mask = e_mask.repeat(1, k_weights.shape[-1], 1).reshape(e_vals.shape)
+
     # __Error Checking__
     eps = torch.finfo(dtype).eps
     if tol is None:  # auto-assign if no tolerance was given
-        tol = {torch.float64: 1E-10, torch.float32: 1E-5,
-               torch.float16: 1E-2}[dtype]
+        tol = {torch.float64: 1e-10, torch.float32: 1e-5, torch.float16: 1e-2}[dtype]
     elif tol < eps:  # Ensure tolerance value is viable
-        raise ValueError(f'Tolerance {tol:7.1E} too tight for "{dtype}", '
-                         f'the minimum permitted value is: {eps:7.1E}.')
+        raise ValueError(
+            f'Tolerance {tol:7.1E} too tight for "{dtype}", '
+            f"the minimum permitted value is: {eps:7.1E}."
+        )
 
     if kT is not None and (kT < 0.0).any():  # Negative kT catch
-        raise ValueError(f'kT must be positive or None ({kT})')
+        raise ValueError(f"kT must be positive or None ({kT})")
 
     if torch.lt(n_elec.abs(), eps).any():  # A system has no electrons
-        raise ValueError('Number of elections cannot be zero.')
+        raise ValueError("Number of elections cannot be zero.")
 
     # A system has too many electrons
-    if torch.any((n_elec / pf).gt(e_vals.view(shp).shape[-1] if e_mask is None
-                               else e_mask.view(shp).count_nonzero(-1))):
-        raise ValueError('Number of electrons cannot exceed 2 * n states')
+    if torch.any(
+        (n_elec / pf).gt(
+            e_vals.view(shp).shape[-1]
+            if e_mask is None
+            else e_mask.view(shp).count_nonzero(-1)
+        )
+    ):
+        raise ValueError("Number of electrons cannot exceed 2 * n states")
 
     # __Finite Temperature Disabled__
     # Set the fermi energy to the mid point between the HOMO and LUMO.
     if kT is None:
-        return middle_gap_approximation()
+        return middle_gap_approximation(scale_factor)
 
     # __Finite Temperature Enabled__
     # Perform a fermi level search via the bisection method
@@ -391,17 +421,22 @@ def fermi_search(
             1d are both valid shapes of kT in both batch & single system mode.
             """
             res = scheme(e_vals[m], f[m], kT[m if kT.ndim != 0 else ...])
-            if e_mask is not None:  # Cull "fake" states caused by padding
+            # Cull "fake" states caused by padding, for batch periodic system,
+            # input k_weight have the mask itself over dimension k_points
+            if e_mask is not None and res.dim() < 3:
                 res[~e_mask[m]] = 0.0
 
             # Sum up over all axes apart from the batch dimension
-            return (res * scale_factor).T.sum_to_size(n_elec[m].shape)
+            if isinstance(scale_factor, Tensor):
+                return (res * scale_factor[m]).T.sum_to_size(n_elec[m].shape)
+            else:
+                return (res * scale_factor).T.sum_to_size(n_elec[m].shape)
 
         # If there's an even, integer number of e⁻; try setting e_fermi to
         # the middle gap, i.e. fill according to the Aufbau principle.
         if (mask := abs((n_elec / 2) - (n_elec / 2).round()) <= tol).any():
             # Store fermi value, recalculate № of e⁻ & identity of convergence
-            e_fermi[mask] = middle_gap_approximation()[mask]
+            e_fermi[mask] = middle_gap_approximation(scale_factor)[mask]
             c_mask[mask] = abs(elec_count(e_fermi)[mask] - n_elec[mask]) < tol
 
         # If all systems converged then just return the results now
@@ -411,8 +446,8 @@ def fermi_search(
         # __Setup Bounds for Bisection Search__
         # Identify upper (e_up) & lower (e_lo) search bounds; fermi level should
         # be between the highest & lowest eigenvalues, so start there.
-        e_lo = e_vals.view(shp).min(-1).values
-        e_up = e_vals.view(shp).max(-1).values
+        e_lo = e_vals.reshape(shp).min(-1).values
+        e_up = e_vals.reshape(shp).max(-1).values
         ne_lo, ne_up = elec_count(e_lo), elec_count(e_up)
 
         # Bounds may fail on large kT or full band structures; if too many e⁻
@@ -452,8 +487,7 @@ def fermi_search(
 
             # If maximum allowed number of iterations reached: raise and error.
             if n_steps > max_iter:
-                raise ConvergenceError('Fermi search failed to converge',
-                                       ~c_mask)
+                raise ConvergenceError("Fermi search failed to converge", ~c_mask)
 
         # Return the fermi energy
         return e_fermi

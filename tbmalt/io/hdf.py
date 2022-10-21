@@ -3,6 +3,7 @@
 """Load data."""
 from typing import Tuple, Union, Literal
 from abc import ABC
+import random
 import logging
 import json
 import os
@@ -199,6 +200,8 @@ class LoadHdf(Hdf):
         """Load reference from hdf type data."""
         out_type = kwargs.get('output_type', Tensor)
         test_ratio = kwargs.get('test_ratio', 1.0)
+        version = kwargs.get('version', 'old')
+        global_group = kwargs.get('global_group', 'global_group')
 
         data = {}
         for ipro in properties:
@@ -207,30 +210,66 @@ class LoadHdf(Hdf):
         positions, numbers = [], []
 
         with h5py.File(dataset, 'r') as f:
-            gg = f['global_group']
-            molecule_specie = gg.attrs['molecule_specie_global']
-            _size = int(size / len(molecule_specie))
+
+            gg = f[global_group]
+
+            geo_specie = gg.attrs['molecule_specie_global'] \
+                if version == 'old' else gg.attrs['geometry_specie']
+
+            _size = int(size / len(geo_specie))
 
             # add atom name and atom number
-            for imol_spe in molecule_specie:
-                g = f[imol_spe]
-                g_size = g.attrs['n_molecule']
-                isize = min(g_size, _size)
-                start = 0 if test_ratio == 1.0 else int(isize * (1 - test_ratio))
+            for imol_spe in geo_specie:
+                if version == 'old':
+                    g = f[imol_spe]
+                    g_size = g.attrs['n_molecule']
+                    isize = min(g_size, _size)
+                    start = 0 if test_ratio == 1.0 else int(isize * (1 - test_ratio))
+                    random_idx = random.sample(range(g_size), isize)
 
-                for imol in range(start, isize):  # loop for the same molecule specie
+                    # for imol in range(start, isize):  # loop for the same molecule specie
+                    for imol in random_idx:
 
+                        for ipro in properties:  # loop for each property
+                            idata = g[str(imol + 1) + ipro][()]
+                            data[ipro].append(LoadHdf.to_out_type(idata, out_type))
+
+                        _position = g[str(imol + 1) + 'position'][()]
+                        positions.append(LoadHdf.to_out_type(_position, out_type))
+                        numbers.append(LoadHdf.to_out_type(g.attrs['numbers'], out_type))
+                else:
+                    g = f[imol_spe]
+                    g_size = g.attrs['n_geometry']
+                    isize = min(g_size, _size)
+                    random_idx = random.sample(range(g_size), isize)
+
+                    # for imol in range(start, isize):  # loop for the same molecule specie
                     for ipro in properties:  # loop for each property
-                        idata = g[str(imol + 1) + ipro][()]
-                        data[ipro].append(LoadHdf.to_out_type(idata, out_type))
+                        idata = g[ipro][()][random_idx]
+                        data[ipro].append(torch.from_numpy(idata))
 
-                    _position = g[str(imol + 1) + 'position'][()]
-                    positions.append(LoadHdf.to_out_type(_position, out_type))
-                    numbers.append(LoadHdf.to_out_type(g.attrs['numbers'], out_type))
+                    positions.append(torch.from_numpy(g['positions'][()][random_idx]))
+                    number = torch.from_numpy(g.attrs['numbers']).repeat(len(random_idx), 1)
+                    numbers.append(number)
 
-        if out_type is Tensor:
+                    # for imol in random_idx:
+
+                        # for ipro in properties:  # loop for each property
+                        #     idata = g[str(imol + 1) + ipro][()]
+                        #     data[ipro].append(LoadHdf.to_out_type(idata, out_type))
+
+                        # _position = g[str(imol + 1) + 'position'][()]
+                        # positions.append(LoadHdf.to_out_type(_position, out_type))
+                        # numbers.append(LoadHdf.to_out_type(g.attrs['numbers'], out_type))
+
+        if out_type is Tensor and version == 'old':
             for ipro in properties:  # loop for each property
                 data[ipro] = pack(data[ipro])
+        elif out_type is Tensor and version == 'new':
+            numbers = pack(numbers).flatten(0, 1)
+            positions = pack(positions).flatten(0, 1)
+            for ipro in properties:  # loop for each property
+                data[ipro] = pack(data[ipro]).flatten(0, 1)
 
         return numbers, positions, data
 

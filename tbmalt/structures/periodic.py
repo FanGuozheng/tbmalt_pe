@@ -2,9 +2,10 @@
 import torch
 import numpy as np
 from typing import Union, List, Optional
+
+from tbmalt import Geometry
 from tbmalt.common.batch import pack
 Tensor = torch.Tensor
-# _bohr = 0.529177249
 
 
 class Periodic:
@@ -29,18 +30,16 @@ class Periodic:
         ncell: Number of lattice cells.
 
     Examples:
-        >>> from periodic import Periodic
+        >>> from tbmalt import Periodic
         >>> import torch
     """
 
     def __init__(self, geometry: object, latvec: Tensor,
                  cutoff: Union[Tensor, float], **kwargs):
         self.geometry = geometry
-        self.isperiodic = geometry.isperiodic
+        self.is_periodic = geometry.is_periodic
         self._n_batch = geometry._n_batch if geometry._n_batch is not None else 1
         self.n_atoms = geometry.n_atoms
-        # self.cell = geometry.cell
-        # self.periodic_list = geometry.periodic_list
 
         # mask for periodic and non-periodic systems
         self.mask_pe = self.geometry.periodic_list
@@ -73,8 +72,9 @@ class Periodic:
         self.kpoints, self.n_kpoints, self.k_weights = self._kpoints(**kwargs)
 
         if return_distance is True:
-            self.positions_vec, self.periodic_distances = self._periodic_distance()
-            self.neighbour_vec, self.neighbour_dis = self._neighbourlist()
+            self.mask_central_cell, self.positions_pe, self.positions_vec,\
+                self.periodic_distances = self._periodic_distance()
+            self.neighbour_pos, self.neighbour_vec, self.neighbour_dis = self._neighbourlist()
 
     def _check(self, latvec, cutoff, **kwargs):
         """Check dimension, type of lattice vector and cutoff."""
@@ -161,6 +161,7 @@ class Periodic:
 
     def _periodic_distance(self):
         """Get distances between central cell and neighbour cells."""
+        mask_central_cell = (self.rcellvec != 0).sum(-1) == 0
         positions = self.rcellvec.unsqueeze(2) + self.positions.unsqueeze(1)
         size_system = self.atomic_numbers.ne(0).sum(-1)
         positions_vec = (-positions.unsqueeze(-3) + self.positions.unsqueeze(1).unsqueeze(-2))
@@ -169,16 +170,56 @@ class Periodic:
                             for ipos, icp, inat in zip(
                                 positions, self.positions, size_system)], value=1e3)
 
-        return positions_vec, distance
+        return mask_central_cell, positions, positions_vec, distance
+
+    @property
+    def n_atoms_pe(self):
+        """Periodic number of atoms, include all images."""
+        mask = self.neighbour.any(-1).any(-1)
+        return pack(torch.split(torch.repeat_interleave(
+            self.geometry.n_atoms, mask.sum(-1)), tuple(mask.sum(-1))))
+
+    def supercell(self, idx: Tensor):
+
+        # convert single to batch
+        idx = idx if idx.dim() == 2 else idx.unsqueeze(0)
+
+        ranges = pack([torch.zeros(*idx.shape), idx - 1])
+
+        cellvec = pack([torch.stack([
+            torch.linspace(iran[0, 0], iran[1, 0],
+                           ile[0]).repeat_interleave(ile[2] * ile[1]),
+            torch.linspace(iran[0, 1], iran[1, 1],
+                           ile[1]).repeat(ile[0]).repeat_interleave(ile[2]),
+            torch.linspace(iran[0, 2], iran[1, 2],
+                           ile[2]).repeat(ile[0] * ile[1])])
+                        for ile, iran in zip(idx, ranges.transpose(1, 0))], value=1e3)
+        rcellvec = pack([torch.matmul(ilv.transpose(0, 1), icv.T.unsqueeze(-1)).squeeze(-1)
+                         for ilv, icv in zip(self.latvec, cellvec)], value=1e3)
+
+        positions = rcellvec.unsqueeze(2) + self.positions.unsqueeze(1)
+        atomic_numbers = self.atomic_numbers.repeat(1, positions.shape[-3])
+        positions = positions.flatten(-3, -2)
+        cell = self.geometry.cell * idx
+
+        return Geometry(atomic_numbers, positions, cell=cell)
+
+    @property
+    def atomic_numbers_pe(self):
+        """Periodic number of atoms, include all images."""
+        return pack([number.repeat(nc, 1) for number, nc in zip(self.atomic_numbers, self.ncell)])
 
     def _neighbourlist(self):
         """Get distance matrix of neighbour list according to periodic boundary condition."""
         _mask = self.neighbour.any(-1).any(-1)
+        neighbour_pos = pack([self.positions_pe[ibatch][_mask[ibatch]]
+                              for ibatch in range(self.cutoff.size(0))], value=1e3)
         neighbour_vec = pack([self.positions_vec[ibatch][_mask[ibatch]]
                               for ibatch in range(self.cutoff.size(0))], value=1e3)
         neighbour_dis = pack([self.periodic_distances[ibatch][_mask[ibatch]]
                               for ibatch in range(self.cutoff.size(0))], value=1e3)
-        return neighbour_vec, neighbour_dis
+
+        return neighbour_pos, neighbour_vec, neighbour_dis
 
     def _inverse_lattice(self):
         """Get inverse lattice vectors."""
@@ -188,8 +229,9 @@ class Periodic:
 
         # inverse lattice vectors
         _invlat = torch.transpose(torch.linalg.solve(
-            _latvec, torch.eye(_latvec.shape[-1])), -1, -2)
+            _latvec, torch.eye(_latvec.shape[-1]).repeat(_latvec.shape[0], 1, 1)), -1, -2)
         _invlat[mask_zero] = 0
+
         return _invlat, mask_zero
 
     def _reciprocal_lattice(self):
@@ -249,7 +291,7 @@ class Periodic:
                 _nkx, _nky, _nkz, _nkxz, _kpoints_inv2[..., 1])])
         _z_incr = torch.cat([(torch.arange(iz) * iv).repeat(xy)
                     for iz, xy, iv in zip(_nkz, _nkxy, _kpoints_inv2[..., 2])])
-        # print('base', _x_base, '_x_incr', _x_incr, _nkx, _nkyz, _kpoints_inv2[..., 0])
+
         all_kpoints = torch.stack([
             pack(torch.split((_x_base + _x_incr).unsqueeze(1), n_ind)),
             pack(torch.split((_y_base + _y_incr).unsqueeze(1), n_ind)),
@@ -259,56 +301,50 @@ class Periodic:
         k_weights = k_weights / _n_kpoints.unsqueeze(-1)
 
         return all_kpoints.squeeze(-1).permute(1, 2, 0), _n_kpoints, k_weights
-        # _n_kpoints = _kpoints[..., 0] * _kpoints[..., 1] * _kpoints[..., 2]
-        # _kpoints_inv = 1.0 / _kpoints
-        # _nkxyz = _kpoints[..., 0] * _kpoints[..., 1] * _kpoints[..., 2]
-        # n_ind = tuple(_nkxyz)
-        # _nkx, _nkyz = _kpoints[..., 0], _kpoints[..., 1] * _kpoints[..., 2]
-        # _nky, _nkxz = _kpoints[..., 1], _kpoints[..., 0] * _kpoints[..., 2]
-        # _nkz, _nkxy = _kpoints[..., 2], _kpoints[..., 0] * _kpoints[..., 1]
 
-        # # create K-mesh increase in each direction range from 0~1
-        # _x_incr = torch.cat([torch.repeat_interleave(torch.arange(ii) * iv, yz)
-        #            for ii, yz, iv in zip(_nkx, _nkyz, _kpoints_inv[..., 0])])
-        # _y_incr = torch.cat([torch.repeat_interleave(
-        #     torch.arange(iy) * iv, iz).repeat(ix) for ix, iy, iz, xz, iv in zip(
-        #         _nkx, _nky, _nkz, _nkxz, _kpoints_inv[..., 1])])
-        # _z_incr = torch.cat([(torch.arange(iz) * iv).repeat(xy)
-        #            for iz, xy, iv in zip(_nkz, _nkxy, _kpoints_inv[..., 2])])
+    def _klines(self, klines: Tensor):
+        """K-lines for band structure calculations."""
+        if self._n_batch == 1:
+            if klines.dim() == 2:
+                klines = klines.unsqueeze(0)
+            elif klines.dim() > 3 or klines.dim() == 1:
+                raise ValueError(f"klines dims should be 2 or 3, get {klines.dim()}")
+        else:
+            assert self._n_batch == len(klines), f"klines size {len(klines)} is not consistent with batch size {self._n_batch}"
+            assert klines.dim() == 3, f"klines dims should be 3, get {klines.dim()}"
+        assert klines.shape[-1] == 7, (
+            "Shape error, for each K-line path, "
+            + "last dimension shold include:[kx1, ky1, kz1, kx2, ky2, kz2, N]"
+            + f"but get {klines.shape[-1]} numbers in the last dimension"
+        )
 
-        # all_kpoints = torch.stack([
-        #     pack(torch.split((_x_incr).unsqueeze(1), n_ind)),
-        #     pack(torch.split((_y_incr).unsqueeze(1), n_ind)),
-        #     pack(torch.split((_z_incr).unsqueeze(1), n_ind))])
+        # Faltten all K-Lines so that we can deal with K-Lines only once
+        _n_kpoints = klines[..., -1].sum(-1).long()
+        _klines = klines.flatten(0, 1)
+        _mask = _klines[..., -1].ge(1)
 
-        # k_weights = pack(torch.split(torch.ones(_n_kpoints.sum()), tuple(_n_kpoints)))
-        # k_weights = k_weights / _n_kpoints.unsqueeze(-1)
-        # print('all_kpoints', all_kpoints)
-        # return all_kpoints.squeeze(-1).permute(1, 2, 0), _n_kpoints, k_weights
+        # Extend and get interval K-Points
+        delta_k = _klines[..., 3:6] - _klines[..., :3]
 
-    def _klines(self, _klines: Tensor):
-        """K-lines."""
-        _n_klines = _klines[..., -1].long()
-        _n_kpoints = _n_klines.sum(-1)
-        _n_klines_flat = _n_klines.flatten()
+        delta_k[_mask] = delta_k[_mask] / (_klines[..., -1][_mask].unsqueeze(-1) - 1)
+        delta_k = torch.repeat_interleave(delta_k, _klines[..., -1].long(), 0)
 
-        # Each K-points baseline (original points) and difference
-        # original points (for each batch): k0, k0, k1 ... k_N-1
-        # difference: delta_0_0, delta_1_0, delta_2_1 ... delta_N_N-1
-        _klines_base = torch.cat([
-            _klines[:, 0, :-1].unsqueeze(1), _klines[:, :-1, :-1]], dim=1).reshape(-1, 3)
-        _klines_diff = torch.cat([
-            torch.zeros(_klines.shape[0], 1, 3),
-            _klines[:, 1:, :-1] - _klines[:, :-1, :-1]], dim=1).reshape(-1, 3)
+        repeat_nums = torch.cat(
+            [torch.arange(ik) for ik in _klines[..., -1].long()]).unsqueeze(-1)
+        klines_ext = (
+            torch.repeat_interleave(_klines[..., :3], _klines[..., -1].long(), 0)
+            + delta_k * repeat_nums
+        )
+        klines_ext = pack(klines_ext.split(tuple(_n_kpoints.tolist())))
 
-        _klines_ext = torch.cat([ib + idiff * torch.linspace(
-            0., 1., irep).repeat(3, 1).T for ib, idiff, irep in
-            zip(_klines_base, _klines_diff, _n_klines_flat)])
-        _klines_ext = pack(torch.split(_klines_ext, tuple(_n_kpoints)))
+        # Create averaged weight for each K-Lines
+        k_weights = pack(
+            torch.split(
+                torch.repeat_interleave(1.0 / _n_kpoints, _n_kpoints), tuple(_n_kpoints)
+            )
+        )
 
-        k_weights = 1.0 / _n_kpoints
-
-        return _klines_ext, _n_kpoints, k_weights
+        return klines_ext, _n_kpoints, k_weights
 
     def get_reciprocal_volume(self):
         """Get reciprocal lattice unit cell volume."""
@@ -349,10 +385,6 @@ class Periodic:
         # shape: [n_batch, n_cell, 3]
         cell_vec = self.cellvec_neighbour
 
-        # Get packed selected cell_vector within the cutoff [n_batch, max_cell, 3]
-        # return pack([torch.exp((0. + 1.0j) * torch.bmm(
-        #     ik[mask[0]].unsqueeze(1), cell_vec[mask[0]]))
-        #     for ik in kpoint.permute(1, 0, -1)]).squeeze(2)
         return pack([torch.exp((0. + 1.0j) * torch.einsum(
             'ij, ijk-> ik', ik, cell_vec)) for ik in kpoint.permute(1, 0, -1)])
 

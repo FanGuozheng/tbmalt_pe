@@ -10,6 +10,8 @@ import numpy as np
 from h5py import Group
 import torch
 from torch import Tensor, Size, arange
+
+from tbmalt import Geometry
 from tbmalt.common.batch import pack
 from tbmalt.common import split_by_size
 from tbmalt.common.constants import MAX_ATOMIC_NUMBER
@@ -164,6 +166,15 @@ class Basis:
                         value=-1)
 
     @property
+    def on_atoms_shell(self) -> Tensor:
+        """Identifies which atom each shell belongs to."""
+        if (opa := self.shells_per_atom).ndim == 1:
+            return _repeat_range(opa, device=self.__device)
+        else:
+            return pack([_repeat_range(o, device=self.__device) for o in opa],
+                        value=-1)
+
+    @property
     def on_shells(self) -> Tensor:
         """Identifies which shell each orbital belongs to."""
         if (ops := self.orbs_per_shell).ndim == 1:
@@ -177,6 +188,33 @@ class Basis:
         """Returns ``on_atoms`` if atom resolved & ``on_shells`` if not. """
         # This property allows for resolution agnostic programming.
         return self.on_shells if self.shell_resolved else self.on_atoms
+
+    @property
+    def shells_per_atom(self) -> Tensor:
+        """Returns the number of shells associated with each atom."""
+        return self._shells_per_species[self.atomic_numbers.view(-1)
+                                        ].view_as(self.atomic_numbers)
+
+    def mask(self, geometry, cutoff):
+        # dist = self.geometry.distances_pe if self.geometry.is_periodic\
+        #     else self.geometry.distances
+        dist = geometry.distances
+        mask = dist.lt(cutoff) * dist.gt(0.0)
+        mask_d = mask if not geometry.is_periodic else mask.sum(-1)
+
+        # Expand selected mask to orbital like (s, p1, p2 ...)
+        mask_l = pack([dist.repeat_interleave(n_orb, 0).repeat_interleave(
+            n_orb, 1) for dist, n_orb in zip(mask_d, self.orbs_per_atom)]) if \
+            geometry._n_batch is not None else mask_d.repeat_interleave(
+            self.orbs_per_atom, 0).repeat_interleave(self.orbs_per_atom, 1)
+
+        # Expand selected mask to shell like (s, p ...)
+        mask_s = pack([dist.repeat_interleave(n_orb, 0).repeat_interleave(
+        n_orb, 1) for dist, n_orb in zip(mask_d, self.shells_per_atom)]) if \
+            geometry._n_batch is not None else mask_d.repeat_interleave(
+            self.shells_per_atom, 0).repeat_interleave(self.shells_per_atom, 1)
+
+        return mask_d, mask_l, mask_s
 
     def to(self, device: device) -> 'Basis':
         """Returns a copy of the `Basis` instance on the specified device.
@@ -423,9 +461,6 @@ class Basis:
             ValueError: If an invalid ``form`` option is passed
 
         """
-        if form == 'atomic':
-            raise ValueError('Shell matrix can not be given in "atomic" form')
-
         # 1) Make the first row of the NxN matrix
         s_mat = self.shell_ns.clone()
 
@@ -433,8 +468,18 @@ class Basis:
             s_mat = s_mat.repeat_interleave(torch.where(
                 self.shell_ls == -1, 0, self.shell_ls * 2 + 1).view(-1))
             if self.atomic_numbers.dim() == 2:  # "if batch"
-                s_mat = pack(split_by_size(s_mat, self.n_orbitals), value=-1)
+                s_mat = pack(torch.split(
+                    s_mat, tuple(self.n_orbitals)), value=-1)
+        elif form == 'atomic':
+            _an = self.atomic_numbers[self.atomic_numbers.ne(0)]
+            s_mat = torch.zeros(_an.shape)
+            for iuat in torch.unique(_an):
+                s_mat[_an == iuat] = max(self.shell_dict[int(iuat)])
+            if self.atomic_numbers.dim() == 2:  # "if batch"
+                s_mat = pack(torch.split(s_mat.view(-1),
+                             tuple(self.n_atoms)), value=-1)
 
+        s_mat = torch.from_numpy(s_mat) if isinstance(s_mat, np.ndarray) else s_mat
         # Convert the rows into a full NxNx2 tensor and return it
         return _rows_to_NxNx2(s_mat, self.matrix_shape(form), -1)
 

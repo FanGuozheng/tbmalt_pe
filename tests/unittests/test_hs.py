@@ -71,8 +71,8 @@ def test_hs_single_npe(device):
         path_sk, shell_dict, skf_type='skf',
         geometry=geometry2, interpolation='CubicSpline', integral_type='S')
 
-    ham2 = hs_matrix(geometry2, basis, h_feed2, shell_dict=shell_dict)
-    over2 = hs_matrix(geometry2, basis, s_feed2, shell_dict=shell_dict)
+    ham2 = hs_matrix(geometry2, basis, h_feed2)
+    over2 = hs_matrix(geometry2, basis, s_feed2)
 
     check_h2 = torch.max(abs(ham2 - h_ch4.to('cpu'))) < 5E-9
     check_s2 = torch.max(abs(over2 - s_ch4.to('cpu'))) < 1E-10
@@ -89,7 +89,7 @@ def test_hs_single_npe(device):
         path_sk, shell_dict, skf_type='skf',
         geometry=geometry, interpolation='PolyInterpU', integral_type='H')
 
-    ham3 = hs_matrix(geometry, basis, h_feed3, shell_dict=shell_dict)
+    ham3 = hs_matrix(geometry, basis, h_feed3)
     check_h3 = torch.max(abs(ham3 - h_ch4)) < 1E-14
     check_persistence_h3 = ham3.device == device
 
@@ -101,7 +101,7 @@ def test_hs_single_npe(device):
         path_sk, shell_dict, skf_type='skf',
         geometry=geometry, interpolation='PolyInterpU', integral_type='S')
 
-    over4 = hs_matrix(geometry, basis, s_feed4, shell_dict=shell_dict)
+    over4 = hs_matrix(geometry, basis, s_feed4)
     check_s4 = torch.max(abs(over4 - s_ch4)) < 1E-14
     check_persistence_s4 = over4.device == device
 
@@ -144,10 +144,10 @@ def test_h2_pe(device):
     periodic2 = Periodic(geometry2, geometry2.cell, cutoff=skparams.cutoff,
                          kpoints=kpoints2)
 
-    ham = hs_matrix(periodic, basis, h_feed)
-    over = hs_matrix(periodic, basis, s_feed)
-    ham2 = hs_matrix(periodic2, basis2, h_feed)
-    over2 = hs_matrix(periodic2, basis2, s_feed)
+    ham = hs_matrix(periodic, basis, h_feed, n_kpoints=1, cutoff=skparams.cutoff + 1.0)
+    over = hs_matrix(periodic, basis, s_feed, n_kpoints=1, cutoff=skparams.cutoff + 1.0)
+    ham2 = hs_matrix(periodic2, basis2, h_feed, n_kpoints=4, cutoff=skparams.cutoff + 1.0)
+    over2 = hs_matrix(periodic2, basis2, s_feed, n_kpoints=4, cutoff=skparams.cutoff + 1.0)
 
     ind_r = torch.arange(0, h_h2.shape[-1], 2)
     ind_r2 = torch.arange(0, h_h22.shape[-1], 2)
@@ -202,10 +202,8 @@ def test_h2o_pe(device):
     periodic = Periodic(geometry, geometry.cell, cutoff=skparams.cutoff,
                         kpoints=kpoints)
 
-    ham = hs_matrix(periodic, basis, h_feed)
-    over = hs_matrix(periodic, basis, s_feed)
-    # ham2 = hs_matrix(periodic2, basis2, h_feed)
-    # over2 = hs_matrix(periodic2, basis2, s_feed)
+    ham = hs_matrix(periodic, basis, h_feed, n_kpoints=1, cutoff=skparams.cutoff + 1.0)
+    over = hs_matrix(periodic, basis, s_feed, n_kpoints=1, cutoff=skparams.cutoff + 1.0)
 
     ind_h2o = torch.arange(0, h_h2o.shape[-1], 2)
     ind_h2 = torch.arange(0, h_h2.shape[-1], 2)
@@ -253,7 +251,7 @@ def test_si_pe(device):
     kpoints = torch.tensor([[1, 1, 1]])
     kpoints3 = torch.tensor([[3, 3, 3]])
     kpoints4 = torch.tensor([[3, 3, 3], [1, 2, 2]])
-    klines = torch.tensor([[0.5, 0.5, -0.5, 0], [0, 0, 0, 11]])
+    klines = torch.tensor([[0.5, 0.5, -0.5, 0, 0, 0, 11]])
 
     # Non-periodic geometry
     geometry = Geometry(
@@ -271,7 +269,7 @@ def test_si_pe(device):
         cell=torch.tensor([[
             [6.0, 0.0, 0.0], [0.0, 6.0, 0.0], [0.0, 0.0, 6.0]]]),
         units='angstrom')
-    basis_pe = Basis(geometry_pe.atomic_numbers, shell_dict)
+    basis_pe = Basis(geometry_pe.atomic_numbers, shell_dict, geometry_pe)
 
     # Periodic geometry
     geometry_pe2 = Geometry(
@@ -327,16 +325,17 @@ def test_si_pe(device):
     ham = hs_matrix(geometry, basis, h_feed)
     over = hs_matrix(geometry, basis, s_feed)
 
-    h_pe = hs_matrix(periodic, basis_pe, h_feed)
-    s_pe = hs_matrix(periodic, basis_pe, s_feed)
-    h_pe2 = hs_matrix(periodic2, basis_pe2, h_feed)
-    s_pe2 = hs_matrix(periodic2, basis_pe2, s_feed)
-    h_pe3 = hs_matrix(periodic3, basis_pe2, h_feed)
-    s_pe3 = hs_matrix(periodic3, basis_pe2, s_feed)
-    h_pe4 = hs_matrix(periodic4, basis_pe4, h_feed)
-    s_pe4 = hs_matrix(periodic4, basis_pe4, s_feed)
-    h_pe5 = hs_matrix(periodic5, basis_pe5, h_feed)
-    s_pe5 = hs_matrix(periodic5, basis_pe5, s_feed)
+    h_pe = hs_matrix(periodic, basis_pe, h_feed, n_kpoints=1, cutoff=skparams.cutoff)
+
+    s_pe = hs_matrix(periodic, basis_pe, s_feed, n_kpoints=1, cutoff=skparams.cutoff + 1.0)
+    h_pe2 = hs_matrix(periodic2, basis_pe2, h_feed, n_kpoints=1, cutoff=skparams.cutoff + 1.0)
+    s_pe2 = hs_matrix(periodic2, basis_pe2, s_feed, n_kpoints=1, cutoff=skparams.cutoff + 1.0)
+    h_pe3 = hs_matrix(periodic3, basis_pe2, h_feed, n_kpoints=27, cutoff=skparams.cutoff + 1.0)
+    s_pe3 = hs_matrix(periodic3, basis_pe2, s_feed, n_kpoints=27, cutoff=skparams.cutoff + 1.0)
+    h_pe4 = hs_matrix(periodic4, basis_pe4, h_feed, n_kpoints=torch.tensor([27, 4]), cutoff=skparams.cutoff + 1.0)
+    s_pe4 = hs_matrix(periodic4, basis_pe4, s_feed, n_kpoints=torch.tensor([27, 4]), cutoff=skparams.cutoff + 1.0)
+    h_pe5 = hs_matrix(periodic5, basis_pe5, h_feed, n_kpoints=11, cutoff=skparams.cutoff + 1.0)
+    s_pe5 = hs_matrix(periodic5, basis_pe5, s_feed, n_kpoints=11, cutoff=skparams.cutoff + 1.0)
 
     ind_r = torch.arange(0, hr.shape[-1], 2)
     ind_r2 = torch.arange(0, hr_pe2.shape[-1], 2)
@@ -495,6 +494,8 @@ def test_si_pe(device):
     assert check_persistence_s_pe, 'device check'
 
 
+test_si_pe(torch.device('cpu'))
+
 def test_ch3cho(device):
     """Test TiO2."""
     h_tio2 = _get_matrix('./tests/unittests/data/sk/ch3cho/hamsqr1.dat', device)
@@ -561,8 +562,8 @@ def test_tio2(device):
     periodic = Periodic(geometry, geometry.cell, cutoff=skparams.cutoff,
                         kpoints=kpoints)
 
-    ham = hs_matrix(periodic, basis, h_feed)
-    over = hs_matrix(periodic, basis, s_feed)
+    ham = hs_matrix(periodic, basis, h_feed, n_kpoints=1, cutoff=skparams.cutoff + 1.0)
+    over = hs_matrix(periodic, basis, s_feed, n_kpoints=1, cutoff=skparams.cutoff + 1.0)
 
     ind_tio2 = torch.arange(0, h_tio2.shape[-1], 2)
     check_h_tio2 = torch.max(abs(
@@ -602,8 +603,8 @@ def test_hs_matrix_hdf_npe(device):
         path_skf, shell_dict, skf_type='h5',
         geometry=geometry, interpolation='PolyInterpU', integral_type='S')
 
-    ham = hs_matrix(geometry, basis, h_feed, shell_dict=shell_dict)
-    over = hs_matrix(geometry, basis, s_feed, shell_dict=shell_dict)
+    ham = hs_matrix(geometry, basis, h_feed)
+    over = hs_matrix(geometry, basis, s_feed)
 
     check_h = torch.max(abs(ham - h_ch4)) < 1E-14
     check_s = torch.max(abs(over - s_ch4)) < 1E-14

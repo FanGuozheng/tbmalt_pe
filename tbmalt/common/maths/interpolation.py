@@ -148,6 +148,13 @@ class BicubInterp:
         # this is to transfer x to fraction and its square, cube
         x_fra = (self.xi - self.xmesh[self.nx0]) / (
             self.xmesh[self.nx1] - self.xmesh[self.nx0])
+
+        # xx0 = torch.stack([self.xmesh[..., 0][self.nx0[..., 0]],
+        #                    self.xmesh[..., 1][self.nx0[..., 1]]]).T
+        # xx1 = torch.stack([self.xmesh[..., 0][self.nx1[..., 0]],
+        #                    self.xmesh[..., 1][self.nx1[..., 1]]]).T
+        # x_fra = (self.xi - xx0) / (xx1 - xx0)
+
         xmat = torch.stack([x_fra ** 0, x_fra ** 1, x_fra ** 2, x_fra ** 3])
 
         # get four nearest grid points values, each will be: [natom, natom, 20]
@@ -170,6 +177,9 @@ class BicubInterp:
     def _get_indices(self):
         """Get indices and repeat indices."""
         self.nx0 = torch.searchsorted(self.xmesh, self.xi.detach()) - 1
+        # self.nx0 = torch.stack([
+        #     torch.searchsorted(self.xmesh[..., 0], self.xi.detach()[..., 0]) - 1,
+        #     torch.searchsorted(self.xmesh[..., 1], self.xi.detach()[..., 1]) - 1]).T
 
         # get all surrounding 4 grid points indices and repeat indices
         self.nind = torch.tensor([ii for ii in range(self.batch)])
@@ -571,7 +581,7 @@ class Spline1d:
         B[..., 1:-1] = 3 * (dyp[..., 1:] / dxp[1:] - dyp[..., :-1] / dxp[:-1])
         B = B.permute(1, 0) if B.dim() == 2 else B
 
-        cc, _ = torch.lstsq(B, A)
+        cc = torch.linalg.lstsq(A, B).solution
         cc = cc.permute(1, 0) if cc.dim() == 2 else cc.unsqueeze(0)
         bb = dyp / dxp - dxp * (cc[..., 1:] + 2 * cc[..., :-1]) / 3
         dd = (cc[..., 1:] - cc[..., :-1]) / (3 * dxp)

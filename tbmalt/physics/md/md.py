@@ -31,7 +31,7 @@ class Md:
                  geometry: Geometry,
                  path_to_skf: str,
                  shell_dict: dict,
-                 dftb: Union[Dftb1, Dftb2] = None,
+                 dftb_type: float = 'dftb2',
                  descriptor: object = None,
                  ml_model: object = None,
                  q0: Tensor = None,
@@ -45,7 +45,33 @@ class Md:
         self.q0 = q0
         self.skf_type = skf_type
 
-        self._init_md(dftb, **kwargs)
+        # mask of non-padding positions
+        self.mask = self.geometry.atomic_numbers.ne(0.0)
+        self.a = torch.zeros(*self.geometry.atomic_numbers.shape, 3)
+        self.temperature = kwargs.get('temperature', 273.15)
+        self.n_freedom = (self.geometry.n_atoms - 1) * 3.0
+        init_velocity = kwargs.get('init_velocity', None)
+
+        # Initialize DFTB calculator
+        self.dftb_type = dftb_type
+        if dftb_type == 'dftb2':
+            self.dftb = Dftb2(
+                self.geometry, self.shell_dict, self.path_to_skf,
+                repulsive=True, skf_type=self.skf_type)
+        elif dftb_type == 'dftb3':
+            self.dftb = Dftb3(
+                self.geometry, self.shell_dict, self.path_to_skf,
+                repulsive=True, skf_type=self.skf_type,
+                u_derivative=kwargs.get('u_derivative'),
+                damp_exp=kwargs.get('damp_exp'),
+            )
+
+        self.mass = self.dftb.skparams.mass * mass_units['atomic']
+
+        if init_velocity is None:
+            self.velocity = self._init_velocity(**kwargs)
+        else:
+            self.velocity = init_velocity
 
     def __call__(self, steps: int = 2, deltat: float = 0.1, **kwargs):
         """Run molecular dynamics.
@@ -57,10 +83,9 @@ class Md:
             seed: Random seed for initial velocity.
 
         """
-        self._algorithm = kwargs.get('md_algorithm', 'verlet')
+        self._algorithm = kwargs.get('md_driver', 'verlet')
         self.extra_charge = kwargs.get('extra_charge', 0.0)
-        self.deltat = deltat * time_units[kwargs.get(
-            'time_unit', 'femtoseconds')]
+        self.deltat = deltat * time_units[kwargs.get('time_unit', 'femtoseconds')]
         self._md_energy = []
         self._dftb_energy = []
         self._md_charge = []
@@ -85,29 +110,6 @@ class Md:
             # molecular dynamics calculations
             self.next_md(istep)
             self._dftb_energy.append(self.dftb.total_energy)
-
-    def _init_md(self, dftb, **kwargs):
-        # mask of non-padding positions
-        self.mask = self.geometry.atomic_numbers.ne(0.0)
-        self.a = torch.zeros(*self.geometry.atomic_numbers.shape, 3)
-        self.temperature = kwargs.get('temperature', 273.15)
-        self.n_freedom = (self.geometry.n_atoms - 1) * 3.0
-        init_velocity = kwargs.get('init_velocity', None)
-
-        # Initialize DFTB calculator
-        if dftb is None:
-            self.dftb = Dftb2(
-                self.geometry, self.shell_dict, self.path_to_skf,
-                repulsive=True, skf_type=self.skf_type)
-        else:
-            self.dftb = dftb
-
-        self.mass = self.dftb.skparams.mass * mass_units['atomic']
-
-        if init_velocity is None:
-            self.velocity = self._init_velocity(**kwargs)
-        else:
-            self.velocity = init_velocity
 
     def _init_velocity(self, **kwargs):
         """Get initial velocity."""
@@ -158,14 +160,25 @@ class Md:
         self.deltaq = self.qzero_norm.T - self.dftb.qzero
 
     def get_gradient(self):
-        '"""Calculate gradient from DFTB calculations.'
+        """Calculate gradient from DFTB calculations."""
         self.grad_instance = DftbGradient(
             self.geometry, self.basis, self.dftb.h_feed, self.dftb.s_feed,
-                self.shell_dict, self.dftb.skparams)
+                self.shell_dict, self.dftb.skparams, dftb_type=self.dftb_type)
+
+        kwargs = {}
+        if self.dftb_type == 'dftb3':
+            kwargs.update({
+                'h': self.dftb.h,
+                'damp_exp': self.dftb.damp_exp,
+                's': self.dftb.short_gamma,
+                's_u': -self.dftb.shortgamma_u,
+                'h_u': self.dftb.h_u,
+                'u_derivative': self.dftb.u_derivative,
+            })
 
         _grad = self.grad_instance(
             self._density, self.density_e, self.eigenvalue, self.deltaq,
-            self.dftb.shift_mat, self.dftb.U)
+            self.dftb.shift_mat, self.dftb.U, **kwargs)
 
         return _grad
 
@@ -173,7 +186,7 @@ class Md:
         """"""
         self.a[self.mask] = -(self.grad[self.mask].T / self.mass[self.mask]).T
 
-        self.geometry, new_v, self.velocity = _md_algorithm[self._algorithm](
+        self.geometry, new_v, self.velocity = _md_driver[self._algorithm](
             step, self.geometry.atomic_numbers,
             self.geometry.positions, self.velocity, self.a, self.deltat)
 
@@ -228,6 +241,7 @@ class Md:
         """Total energy for all MD steps."""
         return self.dftb_energy + self.md_energy
 
+
 def boxmuller(u1, u2):
     """Box–Muller transform."""
     assert (u1.ge(0.0) * u1.le(1.0)).all(), 'u1 should be range from 0 to 1'
@@ -237,6 +251,7 @@ def boxmuller(u1, u2):
     tmp2 = 2.0 * np.pi * u2
 
     return tmp1 * torch.cos(tmp2), tmp1 * torch.sin(tmp2)
+
 
 def verlet(step, atomic_numbers, positions, v, a, deltat):
     """"""
@@ -250,4 +265,18 @@ def verlet(step, atomic_numbers, positions, v, a, deltat):
 
     return Geometry(atomic_numbers, positions), new_v, v
 
-_md_algorithm = {'verlet': verlet}
+
+def leap_frog(step, atomic_numbers, positions, v, a, deltat):
+    """"""
+    if step > 0:
+        new_v = v + 0.5 * a * deltat
+    else:
+        new_v = v
+
+    v = new_v + 0.5 * a * deltat
+    positions = positions + v * deltat
+
+    return Geometry(atomic_numbers, positions), new_v, v
+
+
+_md_driver = {'verlet': verlet, 'leap_frog': leap_frog}

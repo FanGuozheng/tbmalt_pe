@@ -6,7 +6,6 @@ construction, handling and maintenance.
 """
 from functools import reduce, partial
 from typing import Optional, Any, Tuple, List, Union
-import numpy as np
 from collections import namedtuple
 import torch
 

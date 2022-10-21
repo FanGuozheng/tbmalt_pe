@@ -11,11 +11,13 @@ import torch
 import numpy as np
 from h5py import Group
 from ase import Atoms
+import ase.io as io
 from tbmalt.common.batch import pack, merge
 from tbmalt.data.units import length_units
 from tbmalt.structures.cell import Pbc
 
 from tbmalt.data import chemical_symbols
+from tbmalt.data import atomic_numbers as data_numbers
 Tensor = torch.Tensor
 
 
@@ -74,7 +76,7 @@ class Geometry:
     """
 
     __slots__ = ['atomic_numbers', 'positions', 'n_atoms', 'updated_dist_vec',
-                 'cell', 'isperiodic', 'periodic_list', 'frac_list', 'pbc',
+                 'cell', 'is_periodic', 'periodic_list', 'frac_list', 'pbc',
                  '_n_batch', '_mask_dist', '__dtype', '__device']
 
     def __init__(self, atomic_numbers: Union[Tensor, List[Tensor]],
@@ -88,18 +90,20 @@ class Geometry:
         self.positions: Tensor = pack(positions)
         self.updated_dist_vec = kwargs.get('updated_dist_vec', None)
 
-        # bool tensor isperiodic defines if there is solid
+        # bool tensor is_periodic defines if there is solid
         if cell is None:
-            self.isperiodic = False  # no system is solid
+            self.is_periodic = False  # no system is solid
+            self.cell = None
         else:
             cell = pack(cell)
             if cell.eq(0).all():
-                self.isperiodic = False  # all cell is zeros
+                self.is_periodic = False  # all cell is zeros
+                self.cell = None
             else:
                 _cell = Pbc(cell, frac, units)
                 self.cell, self.periodic_list, self.frac_list, self.pbc = \
                     _cell.cell, _cell.periodic_list, _cell.frac_list, _cell.pbc
-                self.isperiodic = True if self.periodic_list.any() else False
+                self.is_periodic = True if self.periodic_list.any() else False
 
         # Mask for clearing padding values in the distance matrix.
         if (temp_mask := self.atomic_numbers != 0).all():
@@ -154,6 +158,7 @@ class Geometry:
             dist = torch.cdist(self.positions, self.positions, p=2)
             # Ensure padding area is zeroed out
             dist[self._mask_dist] = 0
+            torch.diagonal(dist, dim1=-2, dim2=-1).zero_()
             return dist
         else:
             return torch.sqrt((self.updated_dist_vec ** 2).sum(-1))
@@ -295,6 +300,85 @@ class Geometry:
         # Add units meta-data to the atomic positions
         pos.attrs['unit'] = 'bohr'
 
+    def to_vasp(self, output: str, direct=False, selective_dynamics=False, zrange=(0, 10000)):
+        assert self.cell is not None, 'VASP only support PBC system'
+
+        positions = self.positions / length_units['angstrom']
+        cells = self.cell / length_units['angstrom']
+        cell_xyz = torch.sqrt((cells ** 2).sum(-2)).unsqueeze(-2)
+        positions = positions / cell_xyz if direct else positions
+
+        def write_single(number, position, cell):
+            f = open(output, "w")
+            f.write(self.__repr__() + "\n")
+            f.write("1.0 \n")
+
+            for i in range(3):
+                for j in range(3):
+                    f.write(" %15.10f" % cell[i, j])
+                f.write("\n")
+
+            for i in torch.unique(number):
+                f.write(chemical_symbols[i] + " ")
+            f.write("\n")
+
+            for i in torch.unique(number):
+                f.write(" %d" % (sum(number == i)) + " ")
+            f.write("\n")
+
+            if selective_dynamics:
+                f.write("selective dynamics\n")
+
+            if direct:
+                f.write("Direct\n")
+            else:
+                f.write("Cartesian\n")
+            print('selective_dynamics', selective_dynamics)
+
+            if selective_dynamics:
+                for i in torch.unique(number):
+                    print(i)
+                    pos = position[number == i]
+                    for j in range(len(pos)):
+                        for k in range(3):
+                            f.write(" %.12f" % pos[j, k])
+
+                        if pos[j, 2] > zrange[0] and pos[j, 2] < zrange[-1]:
+                            select = ' False False False'
+                        else:
+                            select = ' True True True'
+                        print('select', select, pos[j, 2])
+                        f.write(select + "\n")
+            else:
+                for i in torch.unique(number):
+                    pos = position[number == i]
+                    for j in range(len(pos)):
+                        for k in range(3):
+                            f.write(" %.12f" % pos[j, k])
+                        f.write("\n")
+
+        # Write output file
+        if self._n_batch is None:
+            write_single(self.atomic_numbers, positions, cells)
+        else:
+            for number, position, cell in zip(self.atomic_numbers, positions, cells):
+                write_single(number, position, cell)
+
+
+    def remove_atoms(self, low_limit, up_limit):
+        mask = self.positions[..., 2] < up_limit
+        mask = mask * self.positions[..., 2] > low_limit
+
+        if self._n_batch is None:
+            atomic_numbers = self.atomic_numbers[mask]
+            positions = self.positions[mask]
+        else:
+            atomic_numbers = pack([atom[imask] for atom, imask in zip(self.atomic_numbers, mask)])
+            positions = pack([pos[imask] for pos, imask in zip(self.positions, mask)])
+
+        return Geometry(atomic_numbers, positions, cell=self.cell)
+
+
     def to(self, device: torch.device) -> 'Geometry':
         """Returns a copy of the `Geometry` instance on the specified device
 
@@ -328,8 +412,13 @@ class Geometry:
             raise IndexError(
                 'Geometry slicing is only applicable to batches of systems.')
 
-        return self.__class__(self.atomic_numbers[selector],
-                              self.positions[selector])
+        if self.cell is None:
+            return self.__class__(self.atomic_numbers[selector],
+                                  self.positions[selector])
+        else:
+            return self.__class__(self.atomic_numbers[selector],
+                                  self.positions[selector],
+                                  cell=self.cell[selector])
 
     def __add__(self, other: 'Geometry') -> 'Geometry':
         """Combine two `Geometry` objects together."""
@@ -350,7 +439,14 @@ class Geometry:
         pos_1 = pos_1 if s_batch else pos_1.unsqueeze(0)
         pos_2 = pos_2 if o_batch else pos_2.unsqueeze(0)
 
-        return self.__class__(merge([an_1, an_2]), merge([pos_1, pos_2]))
+        if self.cell is not None:
+            cell_1 = self.cell if s_batch else self.cell.unsqueeze(0)
+            cell_2 = other.cell if o_batch else other.cell.unsqueeze(0)
+
+            return self.__class__(merge([an_1, an_2]), merge([pos_1, pos_2]),
+                                  cell=merge([cell_1, cell_2]))
+        else:
+            return self.__class__(merge([an_1, an_2]), merge([pos_1, pos_2]))
 
     def __eq__(self, other: 'Geometry') -> bool:
         """Check if two `Geometry` objects are equivalent."""
@@ -452,7 +548,8 @@ def batch_chemical_symbols(atomic_numbers: Union[Tensor, List[Tensor]]
 
 
 def unique_atom_pairs(geometry: Optional[Geometry] = None,
-                      unique_atomic_numbers: Optional[Tensor] = None) -> Tensor:
+                      unique_atomic_numbers: Optional[Tensor] = None,
+                      elements: list = None) -> Tensor:
     """Returns a tensor specifying all unique atom pairs.
 
     This takes `Geometry` instance and identifies all atom pairs. This use
@@ -469,9 +566,150 @@ def unique_atom_pairs(geometry: Optional[Geometry] = None,
         uan = geometry.unique_atomic_numbers()
     elif unique_atomic_numbers is not None:
         uan = unique_atomic_numbers
+    elif elements is not None:
+        uan = torch.tensor([data_numbers[element] for element in elements])
     else:
         raise ValueError('Both geometry and unique_atomic_numbers are None.')
 
     n_global = len(uan)
     return torch.stack([uan.repeat(n_global),
                         uan.repeat_interleave(n_global)]).T
+
+def to_atomic_numbers(species: list) -> Tensor:
+    """Return atomic numbers from element species."""
+    return torch.tensor([chemical_symbols.index(isp) for isp in species])
+
+
+def to_element_species(atomic_numbers: Union[Tensor]) -> list:
+    """Return element species from atomic numbers."""
+    assert atomic_numbers.dim() in (
+        1,
+        2,
+    ), f"get input dimension {atomic_numbers.dim()} not 1 or 2"
+    if atomic_numbers.dim() == 1:
+        return [chemical_symbols[int(ia)] for ia in atomic_numbers]
+    else:
+        return [
+            [chemical_symbols[int(ia)] for ia in atomic_number]
+            for atomic_number in atomic_numbers
+        ]
+
+
+class GeometryPbcOneCell(Geometry):
+    """Transfer periodic boundary condition to molecule like system."""
+
+    def __init__(self, geometry: Geometry, periodic):
+        assert geometry.is_periodic, 'This class only works when PBC is True'
+        self.geometry = geometry
+        self.periodic = periodic
+        # self.n_atoms = (self.geometry.n_atoms * self.geometry.periodic.ncell).long()
+        self.n_atoms = (self.geometry.n_atoms * self.cell_mask.sum(-1)).long()
+
+        self.pe_ind0 = self.periodic.ncell.repeat_interleave(self.geometry.n_atoms)
+        self.pe_ind = self.cell_mask.sum(-1).repeat_interleave(self.geometry.n_atoms)
+
+        # method 1, smaller size
+        _atomic_numbers = self.geometry.atomic_numbers[self.geometry.atomic_numbers.ne(0)]
+        _atomic_numbers = torch.repeat_interleave(_atomic_numbers, self.pe_ind)
+        self.atomic_numbers = pack(_atomic_numbers.split(tuple(self.n_atoms)))
+
+        # method 2
+        # self.atomic_numbers = pack([number.repeat_interleave(mask) for number, mask in zip(
+        #     self.geometry.atomic_numbers, self.cell_mask.sum(-1).long())])
+
+        self.positions = self._to_onecell()
+
+        # Mask for clearing padding values in the distance matrix.
+        if (temp_mask := self.atomic_numbers != 0).all():
+            self._mask_dist: Union[Tensor, bool] = False
+        else:
+            self._mask_dist: Union[Tensor, bool] = ~(
+                temp_mask.unsqueeze(-2) * temp_mask.unsqueeze(-1)
+            )
+
+    @property
+    def cell_mask(self):
+        return self.periodic.neighbour.any(-1).any(-1)
+
+    @property
+    def n_cell(self):
+        return (self.n_atoms / self.n_central_atoms).long()
+
+    @property
+    def n_central_atoms(self):
+        return self.geometry.n_atoms
+
+    @property
+    def distances(self) -> Tensor:
+        dist = torch.cdist(self.positions, self.positions, p=2)
+        # Ensure padding area is zeroed out
+        dist[self._mask_dist] = 0.0
+
+        # cdist bug, sometimes distances diagonal is not zero
+        _ind = torch.arange(dist.shape[-1])
+        if not (dist[..., _ind, _ind].eq(0)).all():
+            dist[..., _ind, _ind] = 0
+
+        return dist
+
+    @property
+    def distance_vectors(self) -> Tensor:
+        """Distance vector matrix between atoms in the system."""
+        dist_vec = self.positions.unsqueeze(-2) - self.positions.unsqueeze(-3)
+        dist_vec[self._mask_dist] = 0
+        return dist_vec
+
+    def _to_onecell(self):
+        """Transfer periodic positions to molecule like positions."""
+        # Permute positions to make sure atomic numbers and positions are consistent
+        _pos = self.periodic.positions_pe[self.cell_mask]
+        _pos = _pos.split(tuple(self.cell_mask.sum(-1).tolist()), 0)
+
+        # method 1, smaller size
+        return pack(torch.cat([ipos[:ind, :ia].flatten(0, 1) for ipos, ind, ia in zip(
+            _pos, self.cell_mask.sum(-1), self.geometry.n_atoms)]).split(tuple(self.n_atoms)))
+
+        # method 2
+        # _pos = self.geometry.periodic.positions_pe[self.cell_mask]
+        # return pack(_pos.split(tuple(self.cell_mask.sum(-1).tolist()), 0)).flatten(1, 2)
+
+    @property
+    def cell_mat(self) -> Tensor:
+        """Return indices of cell vector of corresponding atoms."""
+        # When write PBC cell to non-PBC like system, atoms in system come
+        # from different cells, it's important to label the cell indices.
+        # TODO, try to replace pack
+        # method 1, smaller size
+        cellvec = self.periodic.cellvec.permute(0, -1, 1)[self.cell_mask]
+        cellvec = pack([icell.repeat_interleave(ind, dim=0) for icell, ind in zip(
+            cellvec.split(tuple(self.cell_mask.sum(-1))), self.geometry.n_atoms)], value=self.pad_values)
+
+        # method 2
+        # cellvec = self.geometry.periodic.cellvec.permute(0, -1, 1)[self.cell_mask]
+        # cellvec = pack(cellvec.split(tuple(self.cell_mask.sum(-1))), value=self.pad_values)
+        # cellvec = pack(cellvec.repeat_interleave(self.geometry.n_atoms, dim=0)
+        #                .split(tuple(self.geometry.n_atoms)), value=self.pad_values).flatten(1, 2)
+
+        return cellvec
+
+    @property
+    def cell2d_mat(self) -> Tensor:
+        """Return indices of cell and the shape is similar to distances."""
+        tmp = self.cell_mat.unsqueeze(-2) + self.cell_mat.unsqueeze(-3)
+        tmp1 = tmp - self.cell_mat.unsqueeze(-3)
+        tmp2 = tmp - self.cell_mat.unsqueeze(-2)
+
+        return torch.cat([tmp1, tmp2], dim=-1)
+
+    @property
+    def central_cell_ind(self):
+        return (self.cell2d_mat[..., :3] == 0).sum(-1) == 3
+
+    @property
+    def is_periodic(self):
+        """This is a quasi molecule-like geometry."""
+        return False
+
+    @property
+    def pad_values(self):
+        return 1e6

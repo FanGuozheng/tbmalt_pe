@@ -9,7 +9,7 @@ ndarray = np.ndarray
 
 
 def mulliken(overlap: Tensor, density: Tensor, atom_orbitals=None,
-             **kwargs) -> Tensor:
+             **kwargs) -> Tuple[Tensor, Tensor]:
     """Calculate Mulliken charge for both batch system.
 
     Arguments:
@@ -18,28 +18,24 @@ def mulliken(overlap: Tensor, density: Tensor, atom_orbitals=None,
         atom_orbitals: Orbital number for each atom, which is (l + 1) ** 2.
 
     """
-    orbital_resolve = kwargs.get('orbital_resolve', False)
 
     # sum overlap and density by hadamard product, get charge by orbital
     charge_orbital = (density * overlap).sum(dim=1)
 
-    if orbital_resolve:
+    charge = mulliken_orb_to_atom(charge_orbital, atom_orbitals)
+    return charge_orbital, charge
 
-        # return orbital resolved charge
-        return charge_orbital
-    else:
-        assert atom_orbitals is not None
 
-        # get a list of accumulative orbital indices
-        ind_cumsum = [torch.cat((
-            torch.zeros(1), torch.cumsum(ii[ii.ne(0)], -1))).long()
-            for ii in atom_orbitals]
+def mulliken_orb_to_atom(charge_orbital, atom_orbitals):
+    # get a list of accumulative orbital indices
+    ind_cumsum = [torch.cat((
+        torch.zeros(1), torch.cumsum(ii[ii.ne(0)], -1))).long()
+        for ii in atom_orbitals]
 
-        # return charge of each atom for batch system
-        return pack([torch.stack([(icharge[ii: jj]).sum() for ii, jj in zip(
-            icumsum[:-1], icumsum[1:])])
-            for icumsum, icharge in zip(ind_cumsum, charge_orbital)])
-
+    # return charge of each atom for batch system
+    return pack([torch.stack([(icharge[ii: jj]).sum() for ii, jj in zip(
+        icumsum[:-1], icumsum[1:])])
+        for icumsum, icharge in zip(ind_cumsum, charge_orbital)])
 
 def _generate_broadening(energies: Tensor, eps: Tensor,
                          sigma: Union[Real, Tensor] = 0.0) -> Tensor:
@@ -71,9 +67,9 @@ def _generate_broadening(energies: Tensor, eps: Tensor,
     return ((gb - ga).T / (2.0 * de)).T
 
 
-def dos(eps: Tensor, energies: Tensor, sigma: Union[Real, Tensor] = 0.0,
+def dos(eps: Tensor, energies: Tensor, is_periodic, sigma: Union[Real, Tensor] = 0.5,
         offset: Optional[Union[Real, Tensor]] = None,
-        mask: Optional[Tensor] = None, scale: bool = False) -> Tensor:
+        mask: Optional[Tensor] = None, scale: bool = False,) -> Tensor:
     r"""Calculates the density of states for one or more systems.
 
     This calculates and returns the Density of States (DoS) for one or more
@@ -162,13 +158,20 @@ def dos(eps: Tensor, energies: Tensor, sigma: Union[Real, Tensor] = 0.0,
     if scale:
         distribution = distribution / distribution.max(-1, keepdim=True)[0]
 
+    # combing energy and dos
+    distribution = torch.stack([g.sum(-1), distribution])
+    if is_periodic:
+        print('distribution', distribution.shape)
+        distribution = distribution.sum(1)
+        print('distribution', distribution.shape)
+
     return distribution
 
 
 def pdos(C: Tensor, S: Tensor, eps: Tensor, energies: Tensor,
          sigma: Real = 0.1, offset: Optional[Real] = None,
          mask: Optional[Tensor] = None,
-         scale: bool = False,
+         scale: bool = False, is_periodic=False,
          ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     r"""Calculates the projected density of states for one or more systems.
 
@@ -254,7 +257,12 @@ def pdos(C: Tensor, S: Tensor, eps: Tensor, energies: Tensor,
     g = _generate_broadening(energies, eps, sigma)
 
     # Compute the projected densities of states
-    distributions = torch.einsum('...vi,...ui,...vu,...ei->...ue', C, C, S, g)
+    if is_periodic:
+        distri1 = torch.einsum('...vi,...ui,...vu->...ui', C, C, S)
+        distributions = (distri1.unsqueeze(-2) * g.unsqueeze(-3)).sum(-1).sum(0).real
+        distributions = torch.stack([g, distributions])
+    else:
+        distributions = torch.einsum('...vi,...ui,...vu,...ei->...ue', C, C, S, g)
 
     # Rescale distributions so the total DoS has a maximum value of 1.
     if scale:
@@ -263,6 +271,10 @@ def pdos(C: Tensor, S: Tensor, eps: Tensor, energies: Tensor,
         distributions = distributions / distributions.sum(-2, keepdim=True).amax(-1).unsqueeze(-1)
 
     return distributions
+
+def pdos_pe(q, eps):
+    pass
+
 
 
 def resolve_distributions(distributions: Tensor, resolve_by: Tensor

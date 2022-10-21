@@ -4,3 +4,4 @@
 The primary machine learning components of TBMaLT are located within this
 module.
 """
+from tbmalt.ml.mbtr import Mbtr

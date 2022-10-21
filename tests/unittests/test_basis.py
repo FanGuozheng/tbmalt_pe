@@ -570,8 +570,8 @@ def test_basis_shell_number_matrix_single(device):
         # Ensure an exception is raised if an invalid option was passed
     with pytest.raises(ValueError):
         basis.shell_number_matrix('invalid_option')
-    with pytest.raises(ValueError):
-        basis.shell_number_matrix('atomic')
+    # with pytest.raises(ValueError):
+    #     basis.shell_number_matrix('atomic')
 
 
 def test_basis_shell_number_matrix_batch(device):
@@ -668,8 +668,8 @@ def test_basis_shell_number_matrix_batch(device):
         # Ensure an exception is raised if an invalid option was passed
     with pytest.raises(ValueError):
         basis.shell_number_matrix('invalid_option')
-    with pytest.raises(ValueError):
-        basis.shell_number_matrix('atomic')
+    # with pytest.raises(ValueError):
+    #     basis.shell_number_matrix('atomic')
         
 
 def test_basis_atomic_number_matrix_single(device):

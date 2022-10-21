@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """Simple, Anderson mixer modules."""
 import torch
 from abc import ABC, abstractmethod
@@ -76,7 +78,7 @@ class _Mixer(ABC):
         """Get converged property.
 
         Returns:
-            converged: Boolien indicating convergence status.
+            converged: Boolean indicating convergence status.
         """
         # convergence can be controlled either in mixer or out of mixer
         return torch.max(torch.abs(self._delta), -1).values < self.tolerance
@@ -284,3 +286,110 @@ class Anderson(_Mixer):
     def __convergence__(self):
         """Return convergence."""
         return super().__convergence__()
+
+
+class Broyden(_Mixer):
+
+    def __init__(self, q_init: Tensor, mix_param=0.2, generations=3, **kwargs):
+        super().__init__(q_init, mix_param, **kwargs)
+        self.generations = generations
+        self.gamma = kwargs.get('gamma', 0.01)
+        self._build_matrices(self.q_init)
+        self._dQ[0] = self.q_init
+
+    def _build_matrices(self, q_init: Tensor):
+        """Builds the F and dQs matrices.
+
+        F is the charge difference of the latest charge and previous charge.
+        dQs store all the mixing charges.
+
+        Arguments:
+            q_init: The first dQ tensor on which the new are to be based.
+
+        """
+        size = (self.generations + 1, *tuple(q_init.shape))
+        self._F = torch.zeros(size)
+        self._dQ = torch.zeros(size)
+        if self.return_convergence:
+            self.conv_mat = torch.zeros(self.generations + 1, q_init.shape[0],
+                                        dtype=bool)
+
+    def __call__(self, q_new: Tensor, q_old=None, **kwargs):
+        """Perform the actual Anderson mixing operation.
+
+        Arguments:
+            q_new: The newly calculated, pure, dQ vector that is to be mixed.
+            q_old: The previous, mixed charges. If q_old is available,
+                assign q_old to dQs[0].
+
+        """
+        super().__call__(q_new, **kwargs)
+        self._step_number += 1  # increment _step_number
+
+        self._F[0, self.mask, :self.this_size] = \
+            self.qnew - self._dQ[0, self.mask, :self.this_size]
+
+        if self._step_number >= 2:
+            previous_step = self._step_number if self._step_number < \
+                self.generations + 1 else self.generations + 1
+
+            # solve the linear equation system: equation 4.1 ~ 4.3
+            tmp1 = self._F[0, self.mask] - self._F[1: previous_step, self.mask]
+            bb = torch.bmm(tmp1.transpose(1, 0),
+                           torch.unsqueeze(self._F[0, self.mask], -1))
+            aa = bb.permute(0, 2, 1) - torch.matmul(
+                self._F[1: previous_step, self.mask].transpose(1, 0),
+                tmp1.permute(1, 2, 0))
+
+            # to equation 8.2 (Eyert) for linear dependent problem
+            if self.gamma is not None:
+                aa = aa * (1 + torch.eye(aa.shape[-1]) * self.gamma ** 2)
+
+            # Solve for the coefficients, use mask to avoid singular U error
+            thetas = torch.linalg.solve(aa, bb).squeeze(-1)
+            q_bar = (thetas * self._dQ[1: previous_step, self.mask].transpose(
+                2, 0)).transpose(2, 0).sum(0)
+            F_bar = (thetas * self._F[1: previous_step, self.mask].transpose(
+                2, 0)).transpose(2, 0).sum(0)
+
+            # replace first terms of equations 4.1 and 4.2 with DFTB+ format
+            theta_0 = 1 - thetas.sum(1)
+            q_bar = q_bar + (theta_0 * self._dQ[0, self.mask].T).T
+            F_bar = F_bar + (theta_0 * self._F[0, self.mask].T).T
+
+            # Calculate the new mixed dQ following equation 4.4 (Eyert):
+            q_mix = q_bar + (self.mix_param * F_bar)
+
+        # If there is insufficient history for Anderson; use simple mixing
+        else:
+            q_mix = self._dQ[0, self.mask] + (self._F[0, self.mask] * self.mix_param)
+
+        # Shift F & dQ histories to avoid a pytorch inplace error
+        self._F[:, self.mask] = torch.roll(self._F[:, self.mask], 1, 0)
+        self._dQ[:, self.mask] = torch.roll(self._dQ[:, self.mask], 1, 0)
+
+        # assign the mixed dQ to the dQs history array
+        self._dQ[0, self.mask] = q_mix
+
+        # Save the last difference to _delta for convergence
+        if self.return_convergence:
+            self._delta = self._F[1]
+            self.conv_mat[0] = self.__convergence__()
+            self.conv_mat = torch.roll(self.conv_mat, 1, 0)
+            return q_mix, self.conv_mat[1]
+        else:
+            return q_mix
+
+    def __convergence__(self):
+        """Return convergence."""
+        return super().__convergence__()
+
+
+
+class DIIS(_Mixer):
+
+    def __init__(self):
+        pass
+
+    def __call__(self, *args, **kwargs):
+        pass

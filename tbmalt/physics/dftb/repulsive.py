@@ -27,9 +27,14 @@ class Repulsive:
         atom_pairs = self.basis.atomic_number_matrix('atomic')
         energy = torch.zeros(self.geometry.distances.shape)
 
+        if self.geometry.distances.dim() == 4:  # PBC, not efficient here
+            atom_pairs = atom_pairs.repeat(
+                self.geometry.distances.shape[-1], 1, 1, 1, 1).permute(1, 2, 3, 0, -1)
+
         for iap in uap:
             # get rid of the same atom interaction
             mask_dist = self.geometry.distances.ne(0)
+
             r_cutoff = self.rep_feed.sktable_dict[(*iap.tolist(), 'rep_cut')]
 
             # get mask for different atom pairs
@@ -62,7 +67,7 @@ class Repulsive:
             grid_l = self.rep_feed.sktable_dict[(*iap.tolist(), 'long_grid')]
 
             mask_l = (self.geometry.distances.le(grid_l[1]) *
-                self.geometry.distances.ge(grid_l[0]) * mask) * mask_dist
+                      self.geometry.distances.ge(grid_l[0]) * mask) * mask_dist
             ind_l = (torch.searchsorted(
                 grid_l, self.geometry.distances) - 1)[mask_l]
 
@@ -74,4 +79,7 @@ class Repulsive:
                     r_table_l[2] * deltar_l ** 2 +  r_table_l[3] * deltar_l ** 3 + \
                         r_table_l[4] * deltar_l ** 4 + r_table_l[5] * deltar_l ** 5
 
-        return 0.5 * energy.sum(-1).sum(-1)
+        if not self.geometry.distances.dim() == 4:
+            return 0.5 * energy.sum(-1).sum(-1)
+        else:
+            return 0.5 * energy.sum(-1).sum(-1).sum(-1)

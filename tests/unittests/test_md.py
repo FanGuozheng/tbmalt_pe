@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Tests for DFTB based MD simulations."""
+import numpy as np
 import torch
 from ase.build import molecule
-from tbmalt.physics.md import Md
-from tbmalt.structures.geometry import Geometry
+from tbmalt import Md, Geometry
 from tbmalt.common.parameter import params
 from tbmalt.common.batch import pack
 torch.set_default_dtype(torch.float64)
@@ -32,6 +32,33 @@ def test_h2(device):
     assert torch.allclose(md.total_energy.squeeze(),
                           h2_e_tot[: step]), 'H2 total energy failed'
 
+
+def test_h2o(device):
+    """Test H2O molecule for the gradient and energy."""
+    geometry = Geometry.from_ase_atoms([molecule('H2O')], device=device)
+    path_to_skf = './data/slko/mio'
+
+    # Test the first MD step gradient
+#     md = Md(geometry, path_to_skf, shell_dict, skf_type='skf')
+#     md(1)
+#     # assert torch.allclose(md.grad, h2_grad1), 'H2 gradient error'
+#     # assert torch.allclose(md.a, h2_a_ref), 'H2 a fialed'
+#
+#     # Get initial velocity from DFTB+ and test energy
+#     # md = Md(geometry, path_to_skf, shell_dict, init_velocity=init_h2_v.unsqueeze(0),
+#     #         skf_type='skf')
+#     step = 400
+#     md(step)
+#     import matplotlib.pyplot as plt
+#     plt.plot(np.arange(step), md.md_energy)
+#     plt.show()
+#     # assert torch.allclose(md.md_energy.squeeze(),
+#     #                       h2_e_md[: step]), 'H2 MD kinetic energy failed'
+#     # assert torch.allclose(md.total_energy.squeeze(),
+#     #                       h2_e_tot[: step]), 'H2 total energy failed'
+#
+#
+# test_h2o(torch.device('cpu'))
 
 def test_h3(device):
     """Test H3 molecule, including the bounds of repulsive grads."""

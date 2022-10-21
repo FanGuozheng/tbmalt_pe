@@ -8,6 +8,7 @@ from torch import Tensor
 from tbmalt import Basis, Geometry, hs_matrix
 from tbmalt.structures.geometry import unique_atom_pairs
 from tbmalt.structures import orbs_to_atom
+from tbmalt.physics.dftb.shortgamma import ShortGamma
 
 
 class DftbGradient:
@@ -26,13 +27,18 @@ class DftbGradient:
                  h_feed: object,
                  s_feed: object,
                  shell_dict,
-                 skparams: object):
+                 skparams: object,
+                 dftb_type: str = 'dftb2',
+                 h: Tensor = None,
+                 exponent: float = None):
         self.geometry = geometry
         self.basis = basis
         self.h_feed = h_feed
         self.s_feed = s_feed
         self.shell_dict = shell_dict
         self.skparams = skparams
+        self.dftb_type = dftb_type
+        self.exponent = exponent
 
         _pos = self.geometry.positions if self.geometry.positions.dim() == 3 \
             else self.geometry.positions.unsqueeze(0)
@@ -70,9 +76,10 @@ class DftbGradient:
 
         # calculate gradients over H0 and S0
         self._dftb1_grad(**kwargs)
+        inv, grad2, grad3 = self.dftb2_grad(**kwargs)
 
-        return self.H0_grad() + self.dftb2_grad() + self.coulomb_grad() + \
-            self.repulsive_grad()
+        return self.H0_grad() + inv - grad2 - grad3 + self.repulsive_grad()
+
 
     def _dftb1_grad(self, **kwargs):
         """Get first derivative of Hamiltonian and overlap SKF integrals."""
@@ -197,31 +204,78 @@ class DftbGradient:
                             self.basis.orbs_per_atom.repeat(3, 1)).reshape(
                                 3, -1, self.max_atm).permute(1, 2, 0)
 
-    def dftb2_grad(self):
+    def dftb2_grad(self, **kwargs):
         _mask = self.geometry.distances.eq(0.0)
+        d_q = self.deltaq.unsqueeze(-1) * self.deltaq.unsqueeze(-2)
 
-        gamma_grad = self.gamma_grad(self.U, self.geometry.distances)
-        # self.deltaq = torch.tensor([[-0.24477691549834546,0.12238845774917229,0.12238845774917229]])
-        _dq = self.deltaq.unsqueeze(1) * self.deltaq.unsqueeze(2)
+        # Calculate 1/R gradients
+        invr_grad = torch.zeros(self.dist.shape)
+        invr_grad[self.mask] = -d_q[self.mask] / (self.dist ** 3)[self.mask]
+        invr_grad = (invr_grad * self.vect).sum(-1).permute(1, 2, 0)
 
-        _tmp = gamma_grad * _dq * self.geometry.distance_vectors.permute(
+        s_r = ShortGamma.gamma_grad_r(
+            self.U, self.geometry.atomic_numbers,
+            self.geometry.distances, self.geometry.is_periodic)
+
+        # gradient for corrected DFTB2
+        if self.dftb_type == 'dftb3':
+            h = kwargs.get('h')
+            damp_exp = kwargs.get('damp_exp')
+            s = kwargs.get('s')
+            u_derivative = kwargs.get('u_derivative')
+            h_u = kwargs.get('h_u')
+            h_r = self.get_h_grad_r(damp_exp, h)
+            sh_r = s_r * h + h_r * s
+            tmp2 = sh_r * d_q
+
+            damp_exp = kwargs.get('damp_exp')
+            s_u = kwargs.get('s_u')
+            tmp3 = self.dftb3_grad(damp_exp, h=h, h_r=h_r, h_u=h_u,
+                                    s=s, s_r=s_r, s_u=s_u, u_derivative=u_derivative)
+        else:
+            tmp2 = s_r * d_q
+
+        tmp2 = tmp2 * self.geometry.distance_vectors.permute(
             -1, 0, 1, 2) / self.geometry.distances
-        _tmp.permute(1, 2, 3, 0)[_mask] = 0
+        tmp2.permute(1, 2, 3, 0)[_mask] = 0
+        grad2 = tmp2.sum(-1).permute(1, 2, 0)
 
-        return -_tmp.sum(-1).permute(1, 2, 0)
+        if self.dftb_type == 'dftb3':
+            tmp3 = tmp3 * self.geometry.distance_vectors.permute(
+                -1, 0, 1, 2) / self.geometry.distances
+            tmp3.permute(1, 2, 3, 0)[_mask] = 0
+            grad3 = tmp3.sum(-1).permute(1, 2, 0)
 
-    def dftb3_grad():
-        pass
+            return invr_grad, grad2, grad3
+        else:
+            return invr_grad, grad2, torch.zeros(grad2.shape)
 
-    def coulomb_grad(self):
-        """Calculate coulomb gradients."""
-        grad = torch.zeros(self.dist.shape)
-        # vect = self.geometry.distance_vectors.clone().permute(-1, 0, 1, 2)
-        grad[self.mask] = -(self.deltaq.unsqueeze(1) *
-                      self.deltaq.unsqueeze(2))[self.mask] / \
-            (self.dist ** 3)[self.mask]
+    def dftb3_grad(self, damp_exp, h, h_u, h_r, s, s_r, s_u, u_derivative):
+        _mask = self.geometry.distances.eq(0.0)
+        Gamma_r = u_derivative.unsqueeze(-1) * ShortGamma.gamma_grad_UR(
+            self.U, self.geometry.atomic_numbers,
+            self.geometry.distances, s=s, s_r=s_r, s_u=s_u,
+            damp_exp=damp_exp, h=h, h_u=h_u, h_r=h_r,)
 
-        return (grad * self.vect).sum(-1).permute(1, 2, 0)
+        d_q = self.deltaq.unsqueeze(-1) * self.deltaq.unsqueeze(-2)
+        d_q2 = self.deltaq.unsqueeze(-1)
+        tmp = ((d_q2 * Gamma_r).permute(0, -1, -2) + d_q2 * Gamma_r) * d_q
+
+        return -1/3 * tmp
+
+    def get_h_grad_r(self, damp_exp, h):
+        uab = (self.U.unsqueeze(-1) + self.U.unsqueeze(-2)) / 2.0
+        return -2 * self.geometry.distances * h * uab ** damp_exp
+
+    # def coulomb_grad(self):
+    #     """Calculate coulomb gradients."""
+    #     grad = torch.zeros(self.dist.shape)
+    #     # vect = self.geometry.distance_vectors.clone().permute(-1, 0, 1, 2)
+    #     grad[self.mask] = -(self.deltaq.unsqueeze(1) *
+    #                   self.deltaq.unsqueeze(2))[self.mask] / \
+    #         (self.dist ** 3)[self.mask]
+    #
+    #     return (grad * self.vect).sum(-1).permute(1, 2, 0)
 
     def repulsive_grad(self):
         grad = torch.zeros(self.geometry.distances.shape)
@@ -282,84 +336,3 @@ class DftbGradient:
                             5.0 * r_table_l[5] * deltar_l ** 4
 
         return (grad * self.vec_dist).sum(-1).permute(1, 2, 0)
-
-    def gamma_grad(self, U: Tensor, distances: Tensor) -> Tensor:
-        """Build the Slater type gamma in second-order term."""
-        # to minimum the if & else conditions raise from single & batch,
-        # increase dimensions U and distances in single system
-        U = U.unsqueeze(0) if U.dim() == 1 else U
-        distances = distances.unsqueeze(0) if distances.dim() == 2 else distances
-
-        # Construct index list for upper triangle gather operation
-        ut = torch.unbind(torch.triu_indices(U.shape[-1], U.shape[-1], 1))
-        distance = distances[..., ut[0], ut[1]]
-
-        # build the whole gamma, shortgamma (without 1/R) and triangular gamma
-        gamma = torch.zeros(*U.shape, U.shape[-1])
-        gamma_tr = torch.zeros(U.shape[0], len(ut[0]))
-
-        # diagonal values is so called chemical hardness Hubbert
-        gamma.diagonal(0, -(U.dim() - 1))[:] = -U
-
-        alpha, beta = U[..., ut[0]] * 3.2, U[..., ut[1]] * 3.2
-
-        # mask of homo or hetero Hubbert in triangular gamma
-        mask_homo, mask_hetero = alpha == beta, alpha != beta
-        mask_homo[distance.eq(0)], mask_hetero[distance.eq(0)] = False, False
-        r_homo, r_hetero = 1.0 / distance[mask_homo], 1.0 / distance[mask_hetero]
-
-        # homo Hubbert
-        tauMean = 0.5 * (alpha[mask_homo] + beta[mask_homo])
-        dd_homo = distance[mask_homo]
-
-        gamma_tr[mask_homo] = -tauMean * torch.exp(-tauMean*dd_homo) * (
-            r_homo + 0.6875 * tauMean + 0.1875 * dd_homo * (tauMean ** 2)
-              + 0.02083333333333333333*(dd_homo**2)*(tauMean**3) ) + torch.exp(
-                  -tauMean*dd_homo) * ( -r_homo**2 + 0.1875*(tauMean**2)
-              + 2.0*0.02083333333333333333*dd_homo*(tauMean**3))
-
-        # print('tauMean', tauMean, 'line1', -tauMean * torch.exp(-tauMean*dd_homo), '\n line24', (
-        #     r_homo + 0.6875 * tauMean + 0.1875 * dd_homo * (tauMean ** 2)
-        #       + 0.02083333333333333333*(dd_homo**2)*(tauMean**3) ), '\n line5',
-        #     torch.exp(-tauMean*dd_homo), '\n line 68', ( -r_homo**2 + 0.1875*(tauMean**2)
-        #     + 2.0*0.02083333333333333333*dd_homo*(tauMean**3)))
-        # print('gamma_tr', gamma_tr[mask_homo])
-        # aa, dd_homo = alpha[mask_homo], distance[mask_homo]
-        # taur = aa * dd_homo
-        # efac = torch.exp(-taur) / 48.0 * r_homo
-        # gamma_tr[mask_homo] = \
-        #     (48.0 + 33.0 * taur + 9.0 * taur ** 2 + taur ** 3) * efac
-
-        # hetero Hubbert
-        aa, bb = alpha[mask_hetero], beta[mask_hetero]
-        dd_homo = distance[mask_hetero]
-
-        val_ab = -aa * torch.exp(- aa * dd_homo) * ((
-            0.5*bb**4*aa/(aa**2-bb**2)**2) - (
-                bb**6-3.0*bb**4*aa**2)/(dd_homo*(aa**2-bb**2)**3) ) + torch.exp(
-                    - aa * dd_homo) * (bb**6-3.0*bb**4*aa**2) / (dd_homo**2 *(aa**2-bb**2)**3)
-        val_ba = -bb * torch.exp(- bb * dd_homo) * ((
-            0.5*aa**4*bb/(bb**2-aa**2)**2) - (
-                aa**6-3.0*aa**4*bb**2)/(dd_homo*(bb**2-aa**2)**3) ) + torch.exp(
-                    - bb * dd_homo) * (aa**6-3.0*aa**4*bb**2) / (dd_homo**2 *(bb**2-aa**2)**3)
-
-        gamma_tr[mask_hetero] = val_ab + val_ba
-        # print('val_ab', val_ab, 'val_ba', val_ba)
-        # dd_hetero = distance[mask_hetero]
-        # aa2, aa4, aa6 = aa ** 2, aa ** 4, aa ** 6
-        # bb2, bb4, bb6 = bb ** 2, bb ** 4, bb ** 6
-        # rab, rba = 1 / (aa2 - bb2), 1 / (bb2 - aa2)
-        # exp_a, exp_b = torch.exp(-aa * dd_hetero), torch.exp(-bb * dd_hetero)
-        # val_ab = exp_a * (0.5 * aa * bb4 * rab ** 2 -
-        #                   (bb6 - 3. * aa2 * bb4) * rab ** 3 * r_hetero)
-        # val_ba = exp_b * (0.5 * bb * aa4 * rba ** 2 -
-        #                   (aa6 - 3. * bb2 * aa4) * rba ** 3 * r_hetero)
-        # gamma_tr[mask_hetero] = val_ab + val_ba
-
-        # to make sure gamma values symmetric
-        gamma[..., ut[0], ut[1]] = gamma_tr
-        gamma[..., ut[1], ut[0]] = gamma[..., ut[0], ut[1]]
-        # print('gamma_tr', gamma_tr, 'gamma', gamma)
-        #REVISE, MAKE DIAG ZERO!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!1
-
-        return gamma

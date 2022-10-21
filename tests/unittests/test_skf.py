@@ -6,7 +6,6 @@ import pytest
 import h5py
 import torch
 from tbmalt.io.skf import Skf
-from tbmalt.ml.skfeeds import VcrFeed
 
 
 ####################
@@ -28,7 +27,7 @@ def skf_files():
             has_r_poly: True if the file contains a valid repulsive polynomial.
             has_r_spline: True if the file contains a repulsive spline.
     """
-    path = 'tests/unittests/data/slko/Au_skf'
+    path = 'tests/unittests/data/io/skf'
     files = {'File_1_Au-Au.skf': (True, True, True),
              'File_2_Au-Au.skf': (True, True, True),
              'File_3_Au-Au.skf': (False, True, True),
@@ -196,8 +195,8 @@ def test_read(device):
                             *args, device)
 
     with file_cleanup(skf, 'skfdb.hdf5'):
-        # Check 3: read should not need the ``atom_pair`` argument to read form
-        # an HDF5 database that only has a single system in it.
+        # Check 3: read should not need the ``atom_pair`` argument to read form an
+        # HDF5 database that only has a single system in it.
         _check_skf_contents(Skf.read('skfdb.hdf5', device=device), *args, device)
 
         # Check 4: an exception should be raise if multiple entries are present in
@@ -226,27 +225,7 @@ def test_write():
         with pytest.raises(FileExistsError):
             Skf.read(skf).write('skfdb.hdf5')
 
-        # Check 2: overwriting should be permitted with the `overwrite`
-        # argument. No such error should be encountered whe the
+        # Check 2: overwriting should be permitted with the `overwrite` argument.
+        # No such error should be encountered whe the
         Skf.read(skf).write('X-X.skf', overwrite=True)
         Skf.read(skf).write('skfdb.hdf5', overwrite=True)
-
-
-def test_vcr(device):
-    """Test Slater-Koster files with various compression radii."""
-    path = './tests/unittests/data/slko/vcrskf'
-    shell_dict = {1: [0], 6: [0, 1]}
-    vcr = torch.tensor([2.0, 5.0])
-    ele_num = torch.tensor([1, 6])
-    vcr = VcrFeed.from_dir(
-        path, shell_dict, vcr=vcr, skf_type='skf', element_numbers=ele_num,
-        path_homo=path, integral_type='H', interpolation='BicubInterp',
-        write_h5=True, h5_name='test.h5')
-
-    # Read h5 VCR data
-    vcr2 = VcrFeed.from_dir(
-        'test.h5', shell_dict, vcr=vcr, skf_type='h5', element_numbers=ele_num,
-        path_homo=path, integral_type='H', interpolation='BicubInterp')
-
-    # Check
-    os.system('rm test.h5')

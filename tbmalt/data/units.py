@@ -108,6 +108,7 @@ energy_units: Dict[str, float] = {
     'au': 1.0
 }
 
+
 # Conversion factors for length units
 length_units: Dict[str, float] = {
     'angstrom': _AA__Bohr, 'aa': _AA__Bohr, 'a': _AA__Bohr,
@@ -115,6 +116,11 @@ length_units: Dict[str, float] = {
     'picometer': 1.0e-2 * _AA__Bohr, 'pm': 1.0e-2 * _AA__Bohr,
     'bohr': 1.0,
     'au': 1.0
+}
+
+
+force_units: Dict[str, float] = {
+    'ev_angstrom': _eV__Hartree * length_units['angstrom'],
 }
 
 # Conversion factors for dipole units

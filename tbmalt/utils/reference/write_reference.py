@@ -5,10 +5,13 @@ The skf include normal skf files or skf with a list of compression radii.
 import h5py
 import torch
 import numpy as np
-from tbmalt.io.loadhdf import LoadHdf
+from tbmalt.io.hdf import LoadHdf
+from tbmalt import Geometry
 from tbmalt.utils.ase.ase_aims import AseAims
 from tbmalt.utils.ase.ase_dftbplus import AseDftb
-
+from tbmalt.data.units import length_units
+from tbmalt.structures.geometry import batch_chemical_symbols
+from tbmalt.common.batch import deflate
 
 class CalReference:
     """Transfer SKF files from skf files to hdf binary type.
@@ -74,9 +77,8 @@ class CalReference:
             result = dftb.run_dftb(self.positions, self.symbols, self.latvecs, properties)
         return result
 
-    @classmethod
-    def to_hdf(cls, results: dict, cal_reference: object,
-               properties: list, **kwargs):
+    def to_hdf(results: dict, cal_reference: object = None,
+               properties: list = ['charge'], geometry: Geometry = None, **kwargs):
         """Generate reference results to binary hdf file.
 
         Arguments:
@@ -88,54 +90,95 @@ class CalReference:
             mode: a: append, w: write into new output file.
         """
         input_type = kwargs.get('input_type', 'ANI-1')
-        numbers = cal_reference.numbers
-        symbols = cal_reference.symbols
-        positions = cal_reference.positions
+        if cal_reference is not None:
+            numbers = cal_reference.numbers
+            symbols = cal_reference.symbols
+            positions = cal_reference.positions
+            atom_specie = cal_reference.atom_specie_global
+        elif geometry is not None:
+            numbers = geometry.atomic_numbers
+
+            # symbols = geometry.chemical_symbols
+            positions = geometry.positions / length_units['a']
+            atom_specie = geometry.unique_atomic_numbers()
+            unique_numbers = torch.unique(numbers, sorted=False, dim=0)
+        global_group = kwargs.get('global_group', 'global_group')
+
         if input_type == 'Si':
             latvec = cal_reference.latvecs
-        atom_specie_global = cal_reference.atom_specie_global
         output_name = kwargs.get('output_name', 'reference.hdf')
         mode = kwargs.get('mode', 'a')  # -> if override output file
 
         with h5py.File(output_name, mode) as f:
 
             # write global parameters
-            gg = f['global_group'] if 'global_group' in f else \
-                f.create_group('global_group')
-            if 'atom_specie_global' in gg.attrs:
-                gg.attrs['atom_specie_global'] = np.unique(np.concatenate(
-                    [gg.attrs['atom_specie_global'],
-                     np.array(atom_specie_global)])).tolist()
+            print('mode', mode)
+            print('global_group in f', global_group, global_group in f)
+            gg = f[global_group] if global_group in f else \
+                f.create_group(global_group)
+            if 'atom_specie' in gg.attrs:
+                gg.attrs['atom_specie'] = np.unique(np.concatenate(
+                    [gg.attrs['atom_specie'],
+                     np.array(atom_specie)])).tolist()
             else:
-                gg.attrs['atom_specie_global'] = atom_specie_global
+                gg.attrs['atom_specie'] = atom_specie
 
-            if 'molecule_specie_global' not in gg.attrs:
-                gg.attrs['molecule_specie_global'] = []
+            if 'geometry_specie' not in gg.attrs:
+                gg.attrs['geometry_specie'] = []
 
-            # write each system with symbol as label
-            for ii, isys in enumerate(symbols):
+            for number in unique_numbers:
+                mask = (number == numbers).all(-1)
+                symbol = batch_chemical_symbols(number)
 
-                if ''.join(isys) not in f.keys():  # -> new molecule specie
+                if ''.join(symbol) not in f.keys():  # -> new molecule specie
 
                     # add to molecule_specie_global in global group
-                    gg.attrs['molecule_specie_global'] = np.unique(
-                        np.concatenate([gg.attrs['molecule_specie_global'],
-                                        np.array([''.join(isys)])])).tolist()
+                    gg.attrs['geometry_specie'] = np.unique(
+                        np.concatenate([gg.attrs['geometry_specie'],
+                                        np.array([''.join(symbol)])])).tolist()
 
-                    g = f.create_group(''.join(isys))
-                    g.attrs['specie'] = isys
-                    g.attrs['numbers'] = numbers[ii]
-                    g.attrs['size_molecule'] = len(isys)
-                    g.attrs['n_molecule'] = 0
-                else:
-                    g = f[''.join(isys)]
+                    g = gg.create_group(''.join(symbol))
+                    g.attrs['label'] = symbol
+                    g.attrs['numbers'] = number
+                    g.attrs['size_geometry'] = torch.count_nonzero(number)
+                    g.attrs['n_geometry'] = mask.sum()
 
-                n_system = g.attrs['n_molecule']  # each molecule specie number
-                g.attrs['n_molecule'] = n_system + 1
-                g.create_dataset(str(n_system + 1) + 'position', data=positions[ii])
-                if input_type == 'Si':
-                    g.create_dataset(str(n_system + 1) + 'lattice vector', data=latvec[ii])
+                # n_geometry = g.attrs['n_geometry']  # each molecule specie number
+                # g.attrs['n_geometry'] = n_geometry + 1
 
-                for iproperty in properties:
-                    iname = str(n_system + 1) + iproperty
-                    g.create_dataset(iname, data=results[iproperty][ii])
+                    g.create_dataset('positions', data=deflate(positions[mask]))
+                    if input_type == 'Si':
+                        g.create_dataset('lattice vector', data=latvec[mask])
+
+                    for pro in properties:
+                        g.create_dataset(pro, data=deflate(results[pro][mask]))
+
+
+            # write each system with symbol as label
+            # for ii, isys in enumerate(symbols):
+            #
+            #     if ''.join(isys) not in f.keys():  # -> new molecule specie
+            #
+            #         # add to molecule_specie_global in global group
+            #         gg.attrs['geometry_specie_global'] = np.unique(
+            #             np.concatenate([gg.attrs['geometry_specie_global'],
+            #                             np.array([''.join(isys)])])).tolist()
+            #
+            #         g = f.create_group(''.join(isys))
+            #         g.attrs['specie'] = isys
+            #         g.attrs['numbers'] = numbers[ii]
+            #         g.attrs['size_geometry'] = len(isys)
+            #         g.attrs['n_geometry'] = 0
+            #     else:
+            #         g = f[''.join(isys)]
+            #
+            #     n_system = g.attrs['n_geometry']  # each molecule specie number
+            #     g.attrs['n_geometry'] = n_system + 1
+            #
+            #     g.create_dataset(str(n_system + 1) + 'position', data=positions[ii])
+            #     if input_type == 'Si':
+            #         g.create_dataset(str(n_system + 1) + 'lattice vector', data=latvec[ii])
+            #
+            #     for iproperty in properties:
+            #         iname = str(n_system + 1) + iproperty
+            #         g.create_dataset(iname, data=results[iproperty][ii])
